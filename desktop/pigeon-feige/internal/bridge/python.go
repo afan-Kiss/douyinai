@@ -92,8 +92,18 @@ func (c *Client) resetDaemon() {
 		_ = c.daemonIn.Close()
 		c.daemonIn = nil
 	}
-	if c.daemon != nil && c.daemon.Process != nil {
-		_ = c.daemon.Process.Kill()
+	cmd := c.daemon
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+		done := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
 	}
 	c.daemon = nil
 	c.daemonOut = nil
@@ -124,7 +134,7 @@ func (c *Client) CleanupNodesWithOptions(reason string, killAll bool, olderThanS
 	}
 	if c.daemonOK && c.daemonIn != nil {
 		c.rpcMu.Lock()
-		_, _ = c.callDaemonWithTimeout(string(body), 2*time.Second)
+		_, _ = c.callDaemonWithTimeoutKillOnTimeout(string(body), 2*time.Second)
 		c.rpcMu.Unlock()
 	}
 	_, _ = c.callOneShot(body)
@@ -210,7 +220,7 @@ func (c *Client) callDaemonLocked(line string) (map[string]any, error) {
 	return out, nil
 }
 
-func (c *Client) callDaemonWithTimeout(line string, timeout time.Duration) (map[string]any, error) {
+func (c *Client) callDaemonWithTimeoutKillOnTimeout(line string, timeout time.Duration) (map[string]any, error) {
 	type result struct {
 		out map[string]any
 		err error
@@ -224,11 +234,10 @@ func (c *Client) callDaemonWithTimeout(line string, timeout time.Duration) (map[
 	case res := <-ch:
 		return res.out, res.err
 	case <-time.After(timeout):
-		// Kill daemon so blocked ReadString in the goroutine unblocks; then reap it.
 		c.resetDaemon()
 		select {
 		case <-ch:
-		case <-time.After(3 * time.Second):
+		case <-time.After(1 * time.Second):
 		}
 		return nil, fmt.Errorf("daemon call timeout")
 	}
@@ -304,7 +313,7 @@ func (c *Client) Call(action string, params map[string]any) (map[string]any, err
 	var out map[string]any
 	if useDaemon {
 		c.rpcMu.Lock()
-		out, err = c.callDaemonWithTimeout(string(body), timeout)
+		out, err = c.callDaemonWithTimeoutKillOnTimeout(string(body), timeout)
 		c.rpcMu.Unlock()
 		if err != nil {
 			c.mu.Lock()
@@ -315,7 +324,7 @@ func (c *Client) Call(action string, params map[string]any) (map[string]any, err
 				c.daemonOK = c.startDaemon()
 				if c.daemonOK {
 					c.rpcMu.Lock()
-					out, err = c.callDaemonWithTimeout(string(body), timeout)
+					out, err = c.callDaemonWithTimeoutKillOnTimeout(string(body), timeout)
 					c.rpcMu.Unlock()
 				}
 			} else if c.requireDaemon(action) {

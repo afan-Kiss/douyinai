@@ -139,17 +139,16 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
         return _ok({"pong": True, "standalone": os.getenv("PIGEON_STANDALONE")})
 
     if action == "process_guard_cleanup":
-        from pigeon_protocol.process_guard import cleanup_dead_registered_processes, process_cleanup, shutdown_local_nodes
+        from pigeon_protocol.process_guard import cleanup_global_nodes, cleanup_stale_nodes, process_cleanup
 
-        shutdown_local_nodes(reason="bridge_cleanup")
-        older = params.get("older_than_sec")
+        reason = str(params.get("reason") or "bridge_cleanup")
         if params.get("kill_all"):
-            report = process_cleanup(kill_all=True)
+            report = cleanup_global_nodes(reason=reason)
         elif params.get("older_than_sec") is not None:
-            report = process_cleanup(kill_all=False, older_than_sec=int(params["older_than_sec"]))
+            report = cleanup_stale_nodes(older_than_sec=int(params["older_than_sec"]), reason=reason)
         else:
             report = process_cleanup(kill_all=bool(params.get("kill_all", False)))
-        report["reason"] = str(params.get("reason") or "bridge_cleanup")
+        report["reason"] = reason
         return _ok(report)
 
     if action == "process_status":

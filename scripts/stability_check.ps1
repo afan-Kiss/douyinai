@@ -190,7 +190,9 @@ function Invoke-ApiCheck {
                     $item.ok = $true
                 }
                 if ($json.node -and $json.node.registered_live -ne $null) {
-                    $item.summary = "node_live=$($json.node.registered_live)/$($json.node.max)"
+                    $actual = $json.node.actual_project_live
+                    $mismatch = $json.node.mismatch
+                    $item.summary = "reg=$($json.node.registered_live) actual=$actual max=$($json.node.max) mismatch=$mismatch"
                 }
                 elseif ($json.accounts) {
                     $item.summary = "accounts=$($json.accounts.Count)"
@@ -224,6 +226,47 @@ function Invoke-ApiCheck {
         }
     }
     return $item
+}
+
+function Test-ProcessStatusLimits {
+    param(
+        [object]$ProcessStatusJson,
+        [string]$Phase
+    )
+    $checks = @()
+    if (-not $ProcessStatusJson -or -not $ProcessStatusJson.node) { return $checks }
+    $n = $ProcessStatusJson.node
+    $reg = [int]$n.registered_live
+    $max = [int]$n.max
+    $checks += [ordered]@{
+        phase  = $Phase
+        name   = 'registered_live'
+        value  = $reg
+        limit  = "<= $MaxNode"
+        pass   = ($reg -le $MaxNode)
+        detail = "max=$max"
+    }
+    if ($null -ne $n.actual_project_live) {
+        $actual = [int]$n.actual_project_live
+        $checks += [ordered]@{
+            phase  = $Phase
+            name   = 'actual_project_live'
+            value  = $actual
+            limit  = "<= $MaxNode"
+            pass   = ($actual -le $MaxNode)
+            detail = 'cmdline scan'
+        }
+        $warnMismatch = [bool]$n.mismatch
+        $checks += [ordered]@{
+            phase  = $Phase
+            name   = 'registry vs actual'
+            value  = if ($warnMismatch) { 'mismatch' } else { 'ok' }
+            limit  = 'no mismatch'
+            pass   = (-not $warnMismatch)
+            detail = if ($warnMismatch) { 'WARNING: registered and actual node counts differ' } else { 'ok' }
+        }
+    }
+    return $checks
 }
 
 function Test-SnapshotLimits {
@@ -292,6 +335,7 @@ function Invoke-StressSuite {
         @{ label = 'session_light'; path = '/api/session?light=1' },
         @{ label = 'accounts'; path = '/api/accounts' },
         @{ label = 'conversations_light'; path = '/api/conversations?category=recent&light=1' },
+        @{ label = 'process_status'; path = '/api/process/status' },
         @{ label = 'qr_status'; path = '/api/qr-login/status' }
     )
     $results = @()
@@ -350,10 +394,31 @@ $apiChecks = @(
     (Invoke-ApiCheck -Path '/api/conversations?category=recent&light=1' -Label 'conversations' -Retries 1)
 )
 
+$processStatusJson = $null
+$psApi = $apiChecks | Where-Object { $_.label -eq 'process_status' } | Select-Object -First 1
+if ($psApi -and $psApi.ok) {
+    try {
+        $rawPs = curl.exe -sS -m $ApiTimeoutSec http://127.0.0.1:8765/api/process/status 2>$null
+        if ($rawPs) { $processStatusJson = $rawPs | ConvertFrom-Json -ErrorAction SilentlyContinue }
+    } catch {}
+}
+if ($processStatusJson) {
+    $limitChecks += Test-ProcessStatusLimits -ProcessStatusJson $processStatusJson -Phase 'baseline'
+}
+
 $stress = $null
 if ($RunStress) {
     $stress = Invoke-StressSuite -Rounds $StressRounds -Before $snapshot
     $limitChecks += Test-SnapshotLimits -Snap $stress.after -Phase 'after_stress'
+    if ($processStatusJson) {
+        try {
+            $rawAfter = curl.exe -sS -m $ApiTimeoutSec http://127.0.0.1:8765/api/process/status 2>$null
+            if ($rawAfter) {
+                $afterPs = $rawAfter | ConvertFrom-Json -ErrorAction SilentlyContinue
+                $limitChecks += Test-ProcessStatusLimits -ProcessStatusJson $afterPs -Phase 'after_stress'
+            }
+        } catch {}
+    }
     $limitChecks += [ordered]@{
         phase  = 'after_stress'
         name   = 'process growth'

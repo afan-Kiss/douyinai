@@ -243,6 +243,7 @@ def sign_via_daemon(unsigned_url: str, *, body: str = "", method: str = "GET", t
                 continue
             if resp.get("id") == req_id:
                 return resp
+        _reset()
         _mark_start_failed()
     return None
 
