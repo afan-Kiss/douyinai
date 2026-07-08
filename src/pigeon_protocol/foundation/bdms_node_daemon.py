@@ -20,26 +20,63 @@ _lock = threading.Lock()
 _proc: subprocess.Popen | None = None
 _seq = 0
 _ready = False
+_node_pid = 0
 
 
-def _reset() -> None:
-    global _proc, _ready
+def _kill_proc() -> None:
+    global _proc, _ready, _node_pid
+    pid = 0
     if _proc and _proc.poll() is None:
+        pid = int(_proc.pid or 0)
         try:
             _proc.kill()
         except OSError:
             pass
+    if pid:
+        try:
+            from pigeon_protocol.process_guard import unregister_node_pid
+
+            unregister_node_pid(pid)
+        except Exception:
+            pass
     _proc = None
     _ready = False
+    _node_pid = 0
+
+
+def _reset() -> None:
+    _kill_proc()
+    try:
+        from pigeon_protocol.process_guard import release_bdms_daemon_lock
+
+        release_bdms_daemon_lock()
+    except Exception:
+        pass
 
 
 def _ensure_daemon() -> bool:
-    global _proc, _ready
+    global _proc, _ready, _node_pid
     if not DAEMON_SCRIPT.is_file():
         return False
     if _proc and _proc.poll() is None and _ready:
         return True
-    _reset()
+
+    from pigeon_protocol.process_guard import (
+        NodeProcessLimitError,
+        acquire_bdms_daemon_lock,
+        prepare_node_spawn,
+        write_bdms_daemon_state,
+    )
+
+    allowed, reason = prepare_node_spawn(kind="bdms_daemon")
+    if not allowed:
+        logger.info("bdms daemon blocked: %s", reason)
+        return False
+    if not acquire_bdms_daemon_lock():
+        logger.info("bdms daemon lock held by another process")
+        return False
+
+    _kill_proc()
     try:
         _proc = popen_hidden(
             ["node", str(DAEMON_SCRIPT)],
@@ -50,9 +87,22 @@ def _ensure_daemon() -> bool:
             bufsize=1,
             cwd=str(ROOT),
         )
+    except NodeProcessLimitError as exc:
+        logger.info("bdms daemon spawn blocked: %s", exc)
+        from pigeon_protocol.process_guard import release_bdms_daemon_lock
+
+        release_bdms_daemon_lock()
+        return False
     except OSError as exc:
         logger.debug("bdms daemon start failed: %s", exc)
+        from pigeon_protocol.process_guard import release_bdms_daemon_lock
+
+        release_bdms_daemon_lock()
         return False
+
+    _node_pid = int(_proc.pid or 0)
+    if _node_pid:
+        write_bdms_daemon_state(node_pid=_node_pid)
 
     def _drain_stderr() -> None:
         if not _proc or not _proc.stderr:
@@ -71,7 +121,8 @@ def _ensure_daemon() -> bool:
         if _proc.poll() is not None:
             break
         time.sleep(0.05)
-    return _ready
+    _reset()
+    return False
 
 
 def sign_via_daemon(unsigned_url: str, *, body: str = "", method: str = "GET", timeout_sec: float = 30.0) -> dict[str, Any] | None:

@@ -16,6 +16,7 @@ import (
 	"github.com/inkeliz/gowebview"
 
 	"pigeon-feige/internal/api"
+	"pigeon-feige/internal/bridge"
 	"pigeon-feige/internal/execwin"
 )
 
@@ -79,6 +80,7 @@ func main() {
 }
 
 func startGoAPI(root string) error {
+	bridge.NewClient(root).CleanupNodes("exe_boot")
 	ln, err := net.Listen("tcp", "127.0.0.1:8765")
 	if err != nil {
 		return fmt.Errorf("bind :8765: %w", err)

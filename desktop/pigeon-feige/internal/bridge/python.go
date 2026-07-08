@@ -93,6 +93,22 @@ func (c *Client) resetDaemon() {
 	c.daemonOK = false
 }
 
+func (c *Client) CleanupNodes(reason string) {
+	body, err := json.Marshal(map[string]any{
+		"action": "process_guard_cleanup",
+		"params": map[string]any{"kill_all": true, "reason": reason},
+	})
+	if err != nil {
+		return
+	}
+	if c.daemonOK && c.daemonIn != nil {
+		c.rpcMu.Lock()
+		_, _ = c.callDaemonWithTimeout(string(body), 2*time.Second)
+		c.rpcMu.Unlock()
+	}
+	_, _ = c.callOneShot(body)
+}
+
 func (c *Client) requireDaemon(action string) bool {
 	switch action {
 	case "qr_login_start", "qr_login_status", "session_status", "listen_start", "listen_stop", "listen_status", "events":
@@ -259,6 +275,7 @@ func (c *Client) Call(action string, params map[string]any) (map[string]any, err
 		if err != nil {
 			c.mu.Lock()
 			if c.requireDaemon(action) {
+				c.CleanupNodes("daemon_timeout")
 				c.resetDaemon()
 				c.daemonOK = c.startDaemon()
 				if c.daemonOK {
@@ -331,6 +348,7 @@ func (c *Client) Ping() error {
 func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.CleanupNodes("bridge_close")
 	c.resetDaemon()
 }
 
@@ -342,18 +360,5 @@ func envOr(k, def string) string {
 }
 
 func (c *Client) PrepareAsync(timeout time.Duration) {
-	root := c.Root
-	py := c.Python
-	go func() {
-		bg := &Client{Root: root, Python: py, daemonOK: false}
-		deadline := time.Now().Add(timeout)
-		for time.Now().Before(deadline) {
-			if err := bg.Ping(); err == nil {
-				_, _ = bg.Call("warm_conv", nil)
-				_ = bg.PreparePure()
-				return
-			}
-			time.Sleep(300 * time.Millisecond)
-		}
-	}()
+	_ = timeout
 }

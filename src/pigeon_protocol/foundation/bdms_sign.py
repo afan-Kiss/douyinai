@@ -125,44 +125,12 @@ def _sign_node(
             error="" if ok else "missing a_bogus/msToken",
         )
 
-    from pigeon_protocol.subprocess_util import run_hidden
-
-    proc = run_hidden(
-        ["node", str(FETCH_SCRIPT), unsigned_url, body_str, method.upper()],
-        capture_output=True,
-        text=True,
-        timeout=timeout_sec,
-        cwd=str(ROOT),
-        check=False,
-    )
-    if not proc.stdout.strip():
-        return BdmsSignResult(
-            ok=False,
-            signed_url=unsigned_url,
-            error=(proc.stderr or proc.stdout or "empty node output")[:400],
-            method=method.upper(),
-        )
-    try:
-        raw = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        return BdmsSignResult(
-            ok=False,
-            signed_url=unsigned_url,
-            error=f"invalid json: {exc}",
-            method=method.upper(),
-        )
-
-    signed_url = best_signed_url(raw, fallback=unsigned_url)
-    tokens = extract_tokens(raw, fallback=signed_url)
-    ok = bool(tokens.get("a_bogus") and tokens.get("msToken"))
     return BdmsSignResult(
-        ok=ok or bool(raw.get("partial")),
-        signed_url=signed_url,
-        tokens=tokens,
-        via="node_bdms",
+        ok=False,
+        signed_url=unsigned_url,
+        error="Node 签名未就绪（daemon 不可用，已禁止 one-shot fallback）",
         method=method.upper(),
-        raw=raw,
-        error="" if ok else "missing a_bogus/msToken",
+        via="node_bdms_daemon/unavailable",
     )
 
 
