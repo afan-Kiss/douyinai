@@ -409,10 +409,12 @@ def _qr_finish_confirmed(
         shop = str(session.cookies.get("SHOP_ID") or session.shop_id or "")
         cookie_count = len(cookies)
         try:
-            from pigeon_protocol.account_context import register_account, session_file
+            from pigeon_protocol.account_context import promote_account_to_shop, register_account, session_file
 
             if aid and shop:
-                register_account(aid, label=f"店铺 {shop}", shop_id=shop, set_active=True)
+                canonical = promote_account_to_shop(aid, shop)
+                aid = canonical
+                job["account_id"] = canonical
             elif aid:
                 register_account(aid, set_active=True)
         except Exception as reg_exc:

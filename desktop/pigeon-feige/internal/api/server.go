@@ -308,17 +308,20 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
 			size = n
 		}
 	}
-	warmCSRF(s.Root)
-	params := map[string]any{"page": page, "size": size}
+	light := r.URL.Query().Get("light") == "1"
+	params := map[string]any{"page": page, "size": size, "light": light}
 	if category := strings.TrimSpace(r.URL.Query().Get("category")); category != "" {
 		params["category"] = category
 	}
+	if !light {
+		warmCSRF(s.Root)
+	}
 	out, err := s.Bridge.Call("conv_list", params)
-	if err != nil || !convListOK(out) {
+	if !light && (err != nil || !convListOK(out)) {
 		_, _ = s.Bridge.Call("session_doctor", map[string]any{"fix": true})
 		out, err = s.Bridge.Call("conv_list", params)
 	}
-	if err != nil || !convListOK(out) {
+	if !light && (err != nil || !convListOK(out)) {
 		_, _ = s.Bridge.Call("refresh_conv_snapshot", map[string]any{"cdp_only": true, "size": size})
 		out, err = s.Bridge.Call("conv_list", params)
 	}

@@ -15,11 +15,10 @@ def _queue_keys_for_category(category: str) -> tuple[str, ...] | None:
     return None
 
 
-def fetch_conversations(*, page: int = 0, size: int = 30, category: str = "") -> dict[str, Any]:
+def fetch_conversations(*, page: int = 0, size: int = 30, category: str = "", light: bool = False) -> dict[str, Any]:
     from pigeon_protocol.config import XUNDAN_QUEUE_KEYS
     from pigeon_protocol.conv_list import list_conversations_relay, parse_conversation_items
     from pigeon_protocol.session import load_session
-    from pigeon_protocol.session_health import auto_heal_session
 
     session = load_session()
     queue_keys = _queue_keys_for_category(category)
@@ -32,6 +31,15 @@ def fetch_conversations(*, page: int = 0, size: int = 30, category: str = "") ->
     code = raw.get("code") or raw.get("st")
     items = parse_conversation_items(raw)
     ok = str(code) in ("0", "200") or bool(items) or bool(raw.get("ok"))
+
+    if light:
+        return {
+            "ok": ok,
+            "items": items,
+            "raw": raw,
+            "count": len(items),
+            "light": True,
+        }
 
     if ok and not items:
         try:
@@ -59,6 +67,8 @@ def fetch_conversations(*, page: int = 0, size: int = 30, category: str = "") ->
         ok = str(code) in ("0", "200") or bool(items) or bool(raw.get("ok"))
 
     if not ok and not items:
+        from pigeon_protocol.session_health import auto_heal_session
+
         auto_heal_session(session, refresh_csrf=True, refresh_sign=True)
         raw = list_conversations_relay(
             session,

@@ -221,7 +221,198 @@ def ensure_account_dirs(account_id: str) -> Path:
     return home
 
 
-def list_accounts() -> list[dict[str, Any]]:
+def account_dedupe_key(row: dict[str, Any], session_doc: dict[str, Any] | None = None) -> str:
+    """Stable key for merging duplicate shop rows in the account picker."""
+    shop = str(row.get("shop_id") or "").strip()
+    if shop:
+        return f"shop:{shop}"
+    if session_doc is None:
+        aid = str(row.get("id") or "").strip()
+        session_doc = _read_json(account_home(aid) / "session.json") or {}
+    cookies = dict(session_doc.get("cookies") or {})
+    shop = str(session_doc.get("shop_id") or cookies.get("SHOP_ID") or "").strip()
+    if shop:
+        return f"shop:{shop}"
+    sid = str(cookies.get("sessionid") or cookies.get("sid_tt") or "").strip()
+    if sid and (row.get("logged_in") or cookies.get("sessionid")):
+        return f"sid:{hashlib.sha256(sid.encode()).hexdigest()[:16]}"
+    return f"empty:{str(row.get('id') or '').strip()}"
+
+
+def _account_canonical_rank(row: dict[str, Any], active_id: str) -> tuple[int, ...]:
+    aid = str(row.get("id") or "")
+    return (
+        1 if aid == active_id else 0,
+        1 if row.get("logged_in") else 0,
+        1 if aid.startswith("shop_") else 0,
+        int(row.get("updated_at") or 0),
+        int(row.get("created_at") or 0),
+    )
+
+
+def dedupe_account_rows(rows: list[dict[str, Any]], *, active_id: str = "") -> list[dict[str, Any]]:
+    """One row per shop; collapse empty slots to a single picker entry."""
+    active = active_id or active_account_id()
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        key = account_dedupe_key(row)
+        groups.setdefault(key, []).append(row)
+    merged: list[dict[str, Any]] = []
+    empty_rows: list[dict[str, Any]] = []
+    for key, group in groups.items():
+        if key.startswith("empty:"):
+            empty_rows.extend(group)
+            continue
+        best = max(group, key=lambda r: _account_canonical_rank(r, active))
+        aliases = [str(r.get("id") or "") for r in group if str(r.get("id") or "") != best.get("id")]
+        if aliases:
+            best = {**best, "alias_ids": aliases}
+        merged.append(best)
+    if empty_rows:
+        pick = max(empty_rows, key=lambda r: _account_canonical_rank(r, active))
+        pick = {
+            **pick,
+            "label": "扫码登录新店铺",
+            "is_empty_slot": True,
+        }
+        merged.append(pick)
+    merged.sort(
+        key=lambda r: (
+            0 if r.get("id") == active else 1,
+            0 if r.get("logged_in") else 1,
+            str(r.get("label") or r.get("id") or ""),
+        )
+    )
+    return merged
+
+
+def _copy_account_session_tree(src_home: Path, dest_home: Path) -> None:
+    dest_home.mkdir(parents=True, exist_ok=True)
+    (dest_home / "bundle").mkdir(parents=True, exist_ok=True)
+    (dest_home / "logs").mkdir(parents=True, exist_ok=True)
+    for rel in _PACK_REL_FILES:
+        src = src_home / rel
+        if not src.is_file():
+            continue
+        dest = dest_home / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.is_file() or src.stat().st_mtime >= dest.stat().st_mtime:
+            shutil.copy2(src, dest)
+
+
+def promote_account_to_shop(account_id: str, shop_id: str) -> str:
+    """After QR login on an empty slot, merge into shop_{id} when possible."""
+    src = str(account_id or "").strip()
+    shop = str(shop_id or "").strip()
+    if not src or not shop:
+        return src
+    canonical = derive_account_id(shop_id=shop)
+    if src == canonical:
+        register_account(canonical, label=f"店铺 {shop}", shop_id=shop, set_active=True)
+        return canonical
+    src_home = account_home(src)
+    dest_home = ensure_account_dirs(canonical)
+    if src_home.is_dir():
+        _copy_account_session_tree(src_home, dest_home)
+    doc = load_registry()
+    doc["accounts"] = [
+        row for row in (doc.get("accounts") or []) if isinstance(row, dict) and str(row.get("id") or "") != src
+    ]
+    save_registry(doc)
+    register_account(canonical, label=f"店铺 {shop}", shop_id=shop, set_active=True)
+    apply_account_env(canonical)
+    logger.info("promoted account %s -> %s (shop %s)", src, canonical, shop)
+    return canonical
+
+
+def consolidate_registry_duplicates() -> dict[str, Any]:
+    """Remove duplicate registry rows that refer to the same logged-in shop."""
+    doc = load_registry()
+    active = str(doc.get("active_account_id") or "").strip()
+    raw_rows: list[dict[str, Any]] = []
+    for row in doc.get("accounts") or []:
+        if not isinstance(row, dict):
+            continue
+        aid = str(row.get("id") or "").strip()
+        if not aid:
+            continue
+        home = account_home(aid)
+        sess = _read_json(home / "session.json") or {}
+        cookies = dict(sess.get("cookies") or {})
+        logged_in = bool(cookies.get("sessionid") or cookies.get("sid_tt"))
+        shop = str(row.get("shop_id") or cookies.get("SHOP_ID") or sess.get("shop_id") or "")
+        raw_rows.append(
+            {
+                "id": aid,
+                "shop_id": shop,
+                "logged_in": logged_in,
+                "updated_at": int(row.get("updated_at") or 0),
+                "created_at": int(row.get("created_at") or 0),
+                "registry_row": row,
+            }
+        )
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for row in raw_rows:
+        if not row.get("logged_in"):
+            continue
+        key = account_dedupe_key(row, None)
+        if key.startswith("empty:"):
+            continue
+        groups.setdefault(key, []).append(row)
+    removed: list[str] = []
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        best = max(group, key=lambda r: _account_canonical_rank(r, active))
+        keep_id = str(best.get("id") or "")
+        for row in group:
+            rid = str(row.get("id") or "")
+            if rid and rid != keep_id:
+                removed.append(rid)
+    if removed:
+        keep_set = set(removed)
+        doc["accounts"] = [
+            row
+            for row in (doc.get("accounts") or [])
+            if isinstance(row, dict) and str(row.get("id") or "") not in keep_set
+        ]
+        if str(doc.get("active_account_id") or "") in keep_set:
+            doc["active_account_id"] = active if active and active not in keep_set else ""
+        save_registry(doc)
+    return {"removed": removed, "count": len(removed)}
+
+
+def _build_account_row(row: dict[str, Any], *, active: str) -> dict[str, Any]:
+    aid = str(row.get("id") or "")
+    home = account_home(aid)
+    sess = _read_json(home / "session.json") or {}
+    cookies = dict(sess.get("cookies") or {})
+    logged_in = bool(cookies.get("sessionid") or cookies.get("sid_tt"))
+    shop = str(row.get("shop_id") or cookies.get("SHOP_ID") or sess.get("shop_id") or "")
+    label = str(row.get("label") or "")
+    if shop:
+        display = f"店铺 {shop}"
+    elif label and label not in (aid, "test", "新账号") and not label.startswith("acct_"):
+        display = label
+    elif label == "新账号" or label == "test" or not label:
+        display = "空账号槽"
+    else:
+        display = label or aid
+    return {
+        "id": aid,
+        "label": display,
+        "shop_id": shop,
+        "active": aid == active,
+        "logged_in": logged_in,
+        "is_empty_slot": not logged_in,
+        "created_at": int(row.get("created_at") or 0),
+        "updated_at": int(row.get("updated_at") or 0),
+        "home": str(home),
+    }
+
+
+def list_accounts(*, dedupe: bool = True) -> list[dict[str, Any]]:
+    consolidate_registry_duplicates()
     doc = load_registry()
     active = active_account_id()
     out: list[dict[str, Any]] = []
@@ -231,32 +422,9 @@ def list_accounts() -> list[dict[str, Any]]:
         aid = str(row.get("id") or "")
         if not aid:
             continue
-        home = account_home(aid)
-        sess = _read_json(home / "session.json") or {}
-        cookies = dict(sess.get("cookies") or {})
-        logged_in = bool(cookies.get("sessionid") or cookies.get("sid_tt"))
-        shop = str(row.get("shop_id") or cookies.get("SHOP_ID") or sess.get("shop_id") or "")
-        label = str(row.get("label") or "")
-        if shop:
-            display = f"店铺 {shop}"
-        elif label and label not in (aid, "test", "新账号") and not label.startswith("acct_"):
-            display = label
-        elif label == "新账号" or label == "test" or not label:
-            display = "空账号槽"
-        else:
-            display = label or aid
-        out.append(
-            {
-                "id": aid,
-                "label": display,
-                "shop_id": shop,
-                "active": aid == active,
-                "logged_in": logged_in,
-                "created_at": int(row.get("created_at") or 0),
-                "updated_at": int(row.get("updated_at") or 0),
-                "home": str(home),
-            }
-        )
+        out.append(_build_account_row(row, active=active))
+    if dedupe:
+        return dedupe_account_rows(out, active_id=active)
     return out
 
 
@@ -290,10 +458,13 @@ def register_account(
     return row
 
 
-def register_account_from_session(session, *, set_active: bool = False) -> str:
+def register_account_from_session(session, *, set_active: bool = False, source_account_id: str = "") -> str:
     cookies = getattr(session, "cookies", None) or {}
     shop = str(getattr(session, "shop_id", "") or cookies.get("SHOP_ID") or "")
     sid = str(cookies.get("sessionid") or cookies.get("sid_tt") or "")
+    src = str(source_account_id or active_account_id() or "").strip()
+    if shop and src and src != derive_account_id(shop_id=shop):
+        return promote_account_to_shop(src, shop)
     aid = derive_account_id(shop_id=shop, sessionid=sid)
     label = f"店铺 {shop}" if shop else aid
     register_account(aid, label=label, shop_id=shop, set_active=set_active)

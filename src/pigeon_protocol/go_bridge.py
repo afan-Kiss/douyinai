@@ -328,7 +328,8 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
         page = int(params.get("page") or 0)
         size = int(params.get("size") or 30)
         category = str(params.get("category") or "")
-        return fetch_conversations(page=page, size=size, category=category)
+        light = bool(params.get("light"))
+        return fetch_conversations(page=page, size=size, category=category, light=light)
 
     if action == "import_har":
         from pathlib import Path

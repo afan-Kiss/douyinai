@@ -100,6 +100,39 @@
   }
 
   const BG_API = { trackProgress: false };
+  const CS_MODE = true;
+
+  function resetWorkspaceState() {
+    state.conversations = [];
+    state.convMeta = {};
+    state.currentUid = "";
+    state.messages = [];
+    state.orders = null;
+    state.ordersLoading = false;
+    state.ordersError = "";
+    state.contextLoading = false;
+    state.aiDraft = "";
+    state.aiIntent = "";
+    state.aiState = "idle";
+    state.humanTakeover = false;
+    state.markedHuman = new Set();
+    state.riskWatch = new Set();
+    $("buyerTitle").textContent = "选择左侧会话";
+    $("buyerAvatar").textContent = "客";
+    $("buyerMeta").textContent = "暂无选中买家";
+    $("msgEmpty").hidden = false;
+    $("messageList").hidden = true;
+    $("messageList").innerHTML = "";
+    $("composerInput").value = "";
+    $("aiDraft").hidden = true;
+    setAiState("idle", "选中会话后，AI 会结合聊天记录和订单信息整理回复。");
+    $("buyerOverviewBody").innerHTML = '<div class="empty-mini muted">选中会话后显示买家信息</div>';
+    $("orderBody").innerHTML = '<div class="empty-mini muted">选中会话后显示订单</div>';
+    $("drawerOrderBody").innerHTML = '<div class="empty-mini muted">选中会话后显示订单</div>';
+    $("insightBody").innerHTML = '<div class="empty-mini muted">AI 会识别买家意图并给出回复建议</div>';
+    $("convCount").textContent = "—";
+    $("convList").innerHTML = '<div class="empty-mini muted">切换账号后请刷新会话列表</div>';
+  }
 
   async function api(path, opt = {}) {
     const track = opt.trackProgress === true;
@@ -177,6 +210,10 @@
   async function refreshProtocolStatus() {
     const pill = $("protoPill");
     if (!pill) return;
+    if (CS_MODE) {
+      pill.hidden = true;
+      return;
+    }
     try {
       const j = await api("/api/protocol/status", BG_API);
       const snap = j.conv_snapshot ? "快照✓" : "快照—";
@@ -364,7 +401,7 @@
       renderLogin(j);
       if (state.loggedIn) {
         if (forceConv || state.conversations.length === 0 || state.activeCategory === "recent") {
-          await refreshConversations(forceConv, state.activeCategory);
+          await refreshConversations(forceConv, state.activeCategory, { heavy: forceConv });
         }
         await syncListenStatus();
         if (!state.listenOn && j.listen_ready !== false) {
@@ -379,12 +416,10 @@
   function accountPickerLabel(a) {
     const shop = String(a.shop_id || "").trim();
     const label = String(a.label || "").trim();
-    if (a.logged_in && shop) return `店铺 ${shop}`;
-    if (a.logged_in && label && label !== a.id) return label;
+    if (a.is_empty_slot || label === "扫码登录新店铺") return "扫码登录新店铺";
     if (shop) return `店铺 ${shop}`;
-    if (label === "新账号" || label === "test" || label === "空账号槽") return "空账号槽";
-    if (label && !/^acct_[0-9a-f]+$/i.test(label)) return label;
-    return "空账号槽";
+    if (label && label !== "空账号槽" && !/^acct_[0-9a-f]+$/i.test(label)) return label;
+    return "扫码登录新店铺";
   }
 
   function renderAccountPicker() {
@@ -396,23 +431,31 @@
     if (!rows.length) {
       const opt = document.createElement("option");
       opt.value = "";
-      opt.textContent = "默认账号";
+      opt.textContent = "未配置账号";
       sel.appendChild(opt);
       return;
     }
-    const sorted = [...rows].sort((a, b) => {
-      if (a.logged_in !== b.logged_in) return a.logged_in ? -1 : 1;
-      if (a.id === active) return -1;
-      if (b.id === active) return 1;
-      return accountPickerLabel(a).localeCompare(accountPickerLabel(b), "zh-CN");
-    });
+    const loggedIn = rows.filter((a) => a.logged_in && !a.is_empty_slot);
+    let emptySlot = rows.find((a) => a.is_empty_slot || !a.logged_in);
+    const sorted = [];
+    const activeRow = loggedIn.find((a) => a.id === active);
+    if (activeRow) sorted.push(activeRow);
+    loggedIn.filter((a) => a.id !== active).forEach((a) => sorted.push(a));
+    if (!emptySlot) {
+      emptySlot = { id: "__new_shop__", is_empty_slot: true, logged_in: false };
+    }
+    if (!sorted.some((a) => a.id === emptySlot.id)) sorted.push(emptySlot);
     for (const a of sorted) {
       const opt = document.createElement("option");
-      opt.value = a.id;
+      opt.value = a.id === "__new_shop__" ? "" : a.id;
       const name = accountPickerLabel(a);
-      const status = a.logged_in ? "已登录" : "未登录";
-      const current = a.id === active ? " · 当前" : "";
-      opt.textContent = `${status} · ${name}${current}`;
+      if (a.id === active && a.logged_in) {
+        opt.textContent = `当前 · ${name}`;
+      } else if (a.logged_in) {
+        opt.textContent = name;
+      } else {
+        opt.textContent = "+ 扫码登录新店铺";
+      }
       if (a.id === active) opt.selected = true;
       sel.appendChild(opt);
     }
@@ -433,9 +476,7 @@
     if (same) return;
     if (!preserveQr) toast("正在切换账号…");
     if (!preserveQr) {
-      state.conversations = [];
-      state.currentUid = "";
-      state.messages = [];
+      resetWorkspaceState();
       state.listenOn = false;
     }
     try {
@@ -459,18 +500,9 @@
 
   async function addAccount() {
     try {
-      const j = await api("/api/accounts/create", {
-        method: "POST",
-        body: JSON.stringify({ label: "新账号" }),
-      });
-      state.accounts = j.accounts || [];
-      state.activeAccountId = j.account_id || "";
-      renderAccountPicker();
-      await refreshLogin();
-      toast("已创建账号槽，请扫码登录");
       await startQrLogin();
     } catch (e) {
-      toast("创建失败: " + (e.message || e));
+      toast("无法开始扫码: " + (e.message || e));
     }
   }
 
@@ -551,37 +583,39 @@
       const sendOk = j.send_ready !== false;
       const needsRenew = j.needs_renew || (j.session_alive && !j.backstage_ok);
       const blockers = j.blockers || onboard.blockers || qr.blockers || [];
+      const action = j.recommended_action || onboard.recommended_action || "";
       const warn =
-        !sendOk && blockers.length
+        !sendOk && blockers.length && !CS_MODE
           ? `<p class="status-err">${blockers.join("；")}</p>`
-          : needsRenew && !sendOk
+          : needsRenew && !sendOk && !CS_MODE
             ? `<p class="status-err">抖店已登录，飞鸽会话需续期（可点下方按钮，无需重新扫码）</p>`
             : "";
-      const action = j.recommended_action || onboard.recommended_action || "";
       let fixBtn = "";
-      if (needsRenew && !sendOk) {
-        fixBtn = '<button type="button" class="btn ghost" id="btnRenewSession">手动续期</button>';
-      } else if (action === "cdp_warm_inners" || action === "rust_sdk_inner") {
-        fixBtn =
-          action === "rust_sdk_inner"
-            ? '<button type="button" class="btn primary" id="btnWarmInners">生成发信密钥（169B）</button>'
-            : '<button type="button" class="btn primary" id="btnWarmInners">预热发信（169B）</button>';
-      } else if (!sendOk) {
-        fixBtn =
-          '<button type="button" class="btn primary" id="btnStartQr">扫码登录</button>' +
-          '<button type="button" class="btn ghost" id="btnReOnboard">浏览器登录</button>';
+      if (!CS_MODE) {
+        if (needsRenew && !sendOk) {
+          fixBtn = '<button type="button" class="btn ghost" id="btnRenewSession">手动续期</button>';
+        } else if (action === "cdp_warm_inners" || action === "rust_sdk_inner") {
+          fixBtn =
+            action === "rust_sdk_inner"
+              ? '<button type="button" class="btn primary" id="btnWarmInners">生成发信密钥（169B）</button>'
+              : '<button type="button" class="btn primary" id="btnWarmInners">预热发信（169B）</button>';
+        } else if (!sendOk) {
+          fixBtn =
+            '<button type="button" class="btn primary" id="btnStartQr">扫码登录</button>' +
+            '<button type="button" class="btn ghost" id="btnReOnboard">浏览器登录</button>';
+        }
       }
       body.innerHTML = `
         <div class="login-profile">
           <div class="avatar lg">${avatarChar(j.shop_name || "店")}</div>
           <div>
             <strong>${j.shop_name || "已登录店铺"}</strong>
-            <p class="muted">${sendOk ? "在线 · 发信就绪" : needsRenew ? "抖店在线 · 飞鸽自动续期中" : "在线 · 监听可用，发信未就绪"}</p>
+            <p class="muted">${sendOk ? "在线 · 可收发消息" : "在线 · 消息同步中"}</p>
             ${warn}
           </div>
         </div>
         <div class="btn-row">
-          <button type="button" class="btn primary" id="btnReQrLogin">扫码登录 / 换号</button>
+          <button type="button" class="btn ghost" id="btnReQrLogin">切换店铺 / 扫码登录</button>
           ${fixBtn}
         </div>`;
       $("btnReQrLogin")?.addEventListener("click", startQrLogin);
@@ -631,10 +665,10 @@
       ${phase === "error" ? `<div class="status-err">${qr.error || "登录出错"}</div>` : ""}
       <div class="btn-row">
         <button type="button" class="btn primary" id="btnStartQr">扫码登录</button>
-        <button type="button" class="btn ghost" id="btnStartCdp">浏览器登录（备用）</button>
+        ${CS_MODE ? "" : '<button type="button" class="btn ghost" id="btnStartCdp">浏览器登录（备用）</button>'}
         ${phase === "expired" || phase === "error" || phase === "waiting_scan" || phase === "fetching" ? '<button type="button" class="btn ghost" id="btnRefreshQr">刷新二维码</button>' : ""}
       </div>`;
-    $("btnStartCdp")?.addEventListener("click", startCdpOnboard);
+    if (!CS_MODE) $("btnStartCdp")?.addEventListener("click", startCdpOnboard);
     $("btnStartQr")?.addEventListener("click", startQrLogin);
     $("btnRefreshQr")?.addEventListener("click", startQrLogin);
   }
@@ -1022,13 +1056,19 @@
     });
   }
 
-  async function refreshConversations(showProgress = false, category) {
+  async function refreshConversations(showProgress = false, category, { heavy = false } = {}) {
     const cat = category || state.activeCategory;
+    if (!isActiveAccountLoggedIn()) {
+      state.conversations = [];
+      renderConvList();
+      return;
+    }
     $("convList").innerHTML = `<div class="skeleton-stack pad"><div class="skeleton line"></div><div class="skeleton line w70"></div></div>`;
     try {
       const qs = new URLSearchParams({ page: "0", size: "50" });
       const apiCategory = convCategoryParam(cat);
       if (apiCategory) qs.set("category", apiCategory);
+      if (!heavy) qs.set("light", "1");
       const j = await api(
         `/api/conversations?${qs}`,
         showProgress ? { trackProgress: true } : BG_API
@@ -1470,18 +1510,24 @@
 
     $("btnRefreshAll").addEventListener("click", () =>
       withBtnLoading($("btnRefreshAll"), async () => {
-        const doc = await sessionDoctor();
-        if (doc.ok === false) toast("会话修复: " + (doc.error || "未完成"));
-        await api("/api/protocol/prepare", { method: "POST", body: "{}", trackProgress: true });
-        await refreshProtocolStatus();
-        await syncListenStatus();
-        if (state.loggedIn && !state.listenOn) await startListening();
-        await refreshConversations(true);
-        if (state.currentUid) await selectConversation(state.currentUid);
+        await refreshLogin(true);
+        if (state.loggedIn) {
+          await refreshConversations(true, state.activeCategory, { heavy: false });
+          if (state.currentUid) await selectConversation(state.currentUid);
+        }
         toast("已刷新");
       })
     );
-    $("accountSelect")?.addEventListener("change", (e) => switchAccount(e.target.value));
+    $("accountSelect")?.addEventListener("change", (e) => {
+      const id = e.target.value;
+      if (!id) {
+        renderAccountPicker();
+        void startQrLogin();
+        return;
+      }
+      if (id === state.activeAccountId) return;
+      switchAccount(id);
+    });
     $("btnAddAccount")?.addEventListener("click", () => addAccount());
     $("btnToggleOrders").addEventListener("click", () => toggleOrdersPanel());
     $("btnCloseDrawer")?.addEventListener("click", (e) => {
@@ -1576,8 +1622,11 @@
     await refreshLogin();
     await refreshProtocolStatus();
     setInterval(pollEvents, 2000);
-    setInterval(() => refreshConversations(false, state.activeCategory), 60000);
-    setInterval(refreshProtocolStatus, 120000);
+    setInterval(() => {
+      if (state.loggedIn && !state.qrPollingActive) {
+        refreshConversations(false, state.activeCategory, { heavy: false });
+      }
+    }, 90000);
     setInterval(async () => {
       try {
         const j = await api("/api/session/keepalive", { method: "POST", body: "{}", ...BG_API });
