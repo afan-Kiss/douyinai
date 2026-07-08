@@ -88,12 +88,16 @@ func (c *Client) bridgeEnv() []string {
 }
 
 func (c *Client) resetDaemon() {
+	if c.daemonIn != nil {
+		_ = c.daemonIn.Close()
+		c.daemonIn = nil
+	}
 	if c.daemon != nil && c.daemon.Process != nil {
 		_ = c.daemon.Process.Kill()
 	}
 	c.daemon = nil
-	c.daemonIn = nil
 	c.daemonOut = nil
+	c.daemonErr = nil
 	c.daemonOK = false
 }
 
@@ -220,6 +224,12 @@ func (c *Client) callDaemonWithTimeout(line string, timeout time.Duration) (map[
 	case res := <-ch:
 		return res.out, res.err
 	case <-time.After(timeout):
+		// Kill daemon so blocked ReadString in the goroutine unblocks; then reap it.
+		c.resetDaemon()
+		select {
+		case <-ch:
+		case <-time.After(3 * time.Second):
+		}
 		return nil, fmt.Errorf("daemon call timeout")
 	}
 }

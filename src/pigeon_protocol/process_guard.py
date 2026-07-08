@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ from pigeon_protocol.config import ROOT
 logger = logging.getLogger("pigeon.process_guard")
 
 PID_FILE_NAME = "node_pids.json"
+REGISTRY_LOCK_FILE_NAME = "node_pids.lock"
 DAEMON_LOCK_FILE_NAME = "bdms_daemon.lock"
 
 PROJECT_CMD_MARKERS = (
@@ -59,7 +61,57 @@ def oneshot_node_fallback_enabled() -> bool:
     return os.getenv("PIGEON_NODE_ONESHOT_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _read_registry() -> dict[str, Any]:
+def _registry_lock_file() -> Path:
+    return runtime_dir() / REGISTRY_LOCK_FILE_NAME
+
+
+@contextlib.contextmanager
+def _registry_file_lock(*, block: bool = True):
+    path = _registry_lock_file()
+    fh = open(path, "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            mode = msvcrt.LK_LOCK if block else msvcrt.LK_NBLCK
+            if not block:
+                for _ in range(40):
+                    try:
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.025)
+                else:
+                    raise TimeoutError("node_pids registry lock timeout")
+            else:
+                msvcrt.locking(fh.fileno(), mode, 1)
+        else:
+            import fcntl
+
+            flags = fcntl.LOCK_EX
+            if not block:
+                flags |= fcntl.LOCK_NB
+            fcntl.flock(fh.fileno(), flags)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+
+def _read_registry_unlocked() -> dict[str, Any]:
     path = _pid_file()
     if not path.is_file():
         return {"processes": [], "updated_at": 0}
@@ -85,9 +137,26 @@ def _read_registry() -> dict[str, Any]:
     return {"processes": processes, "updated_at": int(doc.get("updated_at") or 0)}
 
 
-def _write_registry(doc: dict[str, Any]) -> None:
+def _read_registry() -> dict[str, Any]:
+    with _registry_file_lock(block=True):
+        return _read_registry_unlocked()
+
+
+def _write_registry_unlocked(doc: dict[str, Any]) -> None:
     doc["updated_at"] = int(time.time())
     _pid_file().write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _write_registry(doc: dict[str, Any]) -> None:
+    with _registry_file_lock(block=True):
+        _write_registry_unlocked(doc)
+
+
+def _mutate_registry(mutator) -> None:
+    with _registry_file_lock(block=True):
+        doc = _read_registry_unlocked()
+        mutator(doc)
+        _write_registry_unlocked(doc)
 
 
 def _cmdline_text(cmdline: list[str] | str) -> str:
@@ -122,29 +191,33 @@ def _pid_alive(pid: int) -> bool:
 def register_child_process(kind: str, pid: int, cmdline: list[str] | str) -> None:
     if pid <= 0:
         return
+
+    def _mut(doc: dict[str, Any]) -> None:
+        processes = [p for p in doc.get("processes") or [] if int(p.get("pid") or 0) != pid]
+        processes.append(
+            {
+                "pid": int(pid),
+                "kind": str(kind or "node"),
+                "cmdline": _cmdline_text(cmdline),
+                "created_at": int(time.time()),
+                "owner_pid": os.getpid(),
+            }
+        )
+        doc["processes"] = processes
+
     cleanup_dead_registered_processes()
-    doc = _read_registry()
-    processes = [p for p in doc.get("processes") or [] if int(p.get("pid") or 0) != pid]
-    processes.append(
-        {
-            "pid": int(pid),
-            "kind": str(kind or "node"),
-            "cmdline": _cmdline_text(cmdline),
-            "created_at": int(time.time()),
-            "owner_pid": os.getpid(),
-        }
-    )
-    doc["processes"] = processes
-    _write_registry(doc)
+    _mutate_registry(_mut)
     _local_registered.add(int(pid))
 
 
 def unregister_child_process(pid: int) -> None:
     if pid <= 0:
         return
-    doc = _read_registry()
-    doc["processes"] = [p for p in doc.get("processes") or [] if int(p.get("pid") or 0) != pid]
-    _write_registry(doc)
+
+    def _mut(doc: dict[str, Any]) -> None:
+        doc["processes"] = [p for p in doc.get("processes") or [] if int(p.get("pid") or 0) != pid]
+
+    _mutate_registry(_mut)
     _local_registered.discard(int(pid))
 
 
@@ -173,17 +246,17 @@ def list_registered_processes(kind: str = "node") -> list[dict[str, Any]]:
 
 
 def cleanup_dead_registered_processes() -> None:
-    doc = _read_registry()
-    alive_rows: list[dict[str, Any]] = []
-    for row in doc.get("processes") or []:
-        if not isinstance(row, dict):
-            continue
-        pid = int(row.get("pid") or 0)
-        if pid > 0 and _pid_alive(pid):
-            alive_rows.append(row)
-    if len(alive_rows) != len(doc.get("processes") or []):
+    def _mut(doc: dict[str, Any]) -> None:
+        alive_rows: list[dict[str, Any]] = []
+        for row in doc.get("processes") or []:
+            if not isinstance(row, dict):
+                continue
+            pid = int(row.get("pid") or 0)
+            if pid > 0 and _pid_alive(pid):
+                alive_rows.append(row)
         doc["processes"] = alive_rows
-        _write_registry(doc)
+
+    _mutate_registry(_mut)
 
 
 def _kill_pid(pid: int) -> bool:
@@ -209,29 +282,67 @@ def kill_registered_processes(kind: str = "node", older_than_sec: int | None = N
     cleanup_dead_registered_processes()
     now = int(time.time())
     killed = 0
-    doc = _read_registry()
-    keep: list[dict[str, Any]] = []
-    for row in doc.get("processes") or []:
-        if not isinstance(row, dict):
-            continue
-        row_kind = str(row.get("kind") or "node")
-        if kind and row_kind != kind:
-            keep.append(row)
-            continue
-        pid = int(row.get("pid") or 0)
-        created = int(row.get("created_at") or 0)
-        age = now - created if created else 0
-        if older_than_sec is not None and age < int(older_than_sec):
-            keep.append(row)
-            continue
-        if pid > 0 and _pid_alive(pid):
-            if _kill_pid(pid):
-                killed += 1
-        _local_registered.discard(pid)
-    doc["processes"] = keep
-    _write_registry(doc)
+    to_kill: list[int] = []
+
+    with _registry_file_lock(block=True):
+        doc = _read_registry_unlocked()
+        keep: list[dict[str, Any]] = []
+        for row in doc.get("processes") or []:
+            if not isinstance(row, dict):
+                continue
+            row_kind = str(row.get("kind") or "node")
+            if kind and row_kind != kind:
+                keep.append(row)
+                continue
+            pid = int(row.get("pid") or 0)
+            created = int(row.get("created_at") or 0)
+            age = now - created if created else 0
+            if older_than_sec is not None and age < int(older_than_sec):
+                keep.append(row)
+                continue
+            if pid > 0 and _pid_alive(pid):
+                to_kill.append(pid)
+            _local_registered.discard(pid)
+        doc["processes"] = keep
+        _write_registry_unlocked(doc)
+
+    for pid in to_kill:
+        if _kill_pid(pid):
+            killed += 1
     if killed:
         logger.info("kill_registered_processes kind=%s killed=%d", kind, killed)
+    return killed
+
+
+def kill_owned_registered_processes(kind: str = "node") -> int:
+    """Kill node rows owned by this Python process only."""
+    owner = os.getpid()
+    killed = 0
+    to_kill: list[int] = []
+
+    with _registry_file_lock(block=True):
+        doc = _read_registry_unlocked()
+        keep: list[dict[str, Any]] = []
+        for row in doc.get("processes") or []:
+            if not isinstance(row, dict):
+                continue
+            row_kind = str(row.get("kind") or "node")
+            pid = int(row.get("pid") or 0)
+            row_owner = int(row.get("owner_pid") or 0)
+            owned = row_owner == owner or pid in _local_registered
+            if kind and row_kind == kind and owned and pid > 0 and _pid_alive(pid):
+                to_kill.append(pid)
+                _local_registered.discard(pid)
+                continue
+            keep.append(row)
+        doc["processes"] = keep
+        _write_registry_unlocked(doc)
+
+    for pid in to_kill:
+        if _kill_pid(pid):
+            killed += 1
+    if killed:
+        logger.info("kill_owned_registered_processes kind=%s killed=%d owner=%d", kind, killed, owner)
     return killed
 
 
@@ -374,7 +485,14 @@ def prepare_node_spawn(*, kind: str = "node") -> tuple[bool, str]:
 
 def _atexit_cleanup() -> None:
     try:
-        shutdown_local_nodes(reason="atexit")
+        from pigeon_protocol.foundation.bdms_node_daemon import close_daemon
+
+        close_daemon()
+    except Exception:
+        pass
+    try:
+        kill_owned_registered_processes(kind="node")
+        release_bdms_daemon_lock()
     except Exception:
         pass
 
