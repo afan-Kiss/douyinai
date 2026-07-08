@@ -23,7 +23,8 @@ _proc: subprocess.Popen | None = None
 _seq = 0
 _ready = False
 _last_start_failed_at = 0.0
-_stdout_q: queue.Queue[str | None] = queue.Queue()
+_stdout_generation = 0
+_stdout_q: queue.Queue[tuple[int, str | None]] = queue.Queue()
 _reader_thread: threading.Thread | None = None
 
 
@@ -44,37 +45,46 @@ def _drain_stdout_queue() -> None:
             break
 
 
-def _stop_stdout_reader() -> None:
+def _stop_stdout_reader(*, join_sec: float = 1.0) -> None:
     global _reader_thread
-    _drain_stdout_queue()
+    reader = _reader_thread
+    if reader and reader.is_alive():
+        reader.join(timeout=join_sec)
     _reader_thread = None
+    _drain_stdout_queue()
 
 
-def _start_stdout_reader() -> None:
+def _start_stdout_reader(*, generation: int) -> None:
     global _reader_thread
     if not _proc or not _proc.stdout:
         return
-    if _reader_thread and _reader_thread.is_alive():
-        return
 
-    def _read_loop() -> None:
+    def _read_loop(gen: int) -> None:
         proc = _proc
         if not proc or not proc.stdout:
-            _stdout_q.put(None)
+            _stdout_q.put((gen, None))
             return
         try:
             for line in proc.stdout:
-                _stdout_q.put(line)
+                if gen != _stdout_generation:
+                    break
+                _stdout_q.put((gen, line))
         except (OSError, ValueError):
             pass
         finally:
-            _stdout_q.put(None)
+            _stdout_q.put((gen, None))
 
-    _reader_thread = threading.Thread(target=_read_loop, daemon=True, name="bdms-daemon-stdout")
+    _reader_thread = threading.Thread(
+        target=_read_loop,
+        args=(generation,),
+        daemon=True,
+        name="bdms-daemon-stdout",
+    )
     _reader_thread.start()
 
 
 def _read_response_line(*, timeout_sec: float) -> str | None:
+    gen = _stdout_generation
     deadline = time.time() + max(0.0, timeout_sec)
     while time.time() < deadline:
         if _proc and _proc.poll() is not None:
@@ -83,8 +93,10 @@ def _read_response_line(*, timeout_sec: float) -> str | None:
         if remaining <= 0:
             break
         try:
-            line = _stdout_q.get(timeout=min(0.25, remaining))
+            item_gen, line = _stdout_q.get(timeout=min(0.25, remaining))
         except queue.Empty:
+            continue
+        if item_gen != gen:
             continue
         if line is None:
             return None
@@ -94,26 +106,37 @@ def _read_response_line(*, timeout_sec: float) -> str | None:
 
 
 def _kill_proc() -> None:
-    global _proc, _ready
+    global _proc, _ready, _stdout_generation, _reader_thread
     from pigeon_protocol.process_guard import cleanup_dead_registered_processes, unregister_child_process
 
-    _stop_stdout_reader()
-    pid = 0
-    if _proc and _proc.poll() is None:
-        pid = int(_proc.pid or 0)
+    proc = _proc
+    pid = int(proc.pid or 0) if proc and proc.poll() is None else 0
+    reader = _reader_thread
+    gen = _stdout_generation
+
+    if proc and proc.poll() is None:
         try:
-            _proc.kill()
+            proc.kill()
         except OSError:
             pass
         try:
-            _proc.wait(timeout=3)
+            proc.wait(timeout=3)
         except (subprocess.TimeoutExpired, OSError):
             pass
+
+    if reader and reader.is_alive():
+        reader.join(timeout=1.0)
+
+    _drain_stdout_queue()
+
     if pid:
         unregister_child_process(pid)
+
     _proc = None
     _ready = False
+    _reader_thread = None
     cleanup_dead_registered_processes()
+    _ = gen
 
 
 def _reset() -> None:
@@ -127,7 +150,7 @@ def _reset() -> None:
 
 
 def _ensure_daemon() -> bool:
-    global _proc, _ready
+    global _proc, _ready, _stdout_generation
     if not DAEMON_SCRIPT.is_file():
         return False
     if _proc and _proc.poll() is None and _ready:
@@ -153,6 +176,10 @@ def _ensure_daemon() -> bool:
         return False
 
     _kill_proc()
+    _stdout_generation += 1
+    _drain_stdout_queue()
+    generation = _stdout_generation
+
     cmd = ["node", str(DAEMON_SCRIPT)]
     try:
         _proc = popen_hidden(
@@ -182,7 +209,7 @@ def _ensure_daemon() -> bool:
     if _proc and _proc.pid:
         register_child_process("node", int(_proc.pid), cmd)
 
-    _start_stdout_reader()
+    _start_stdout_reader(generation=generation)
 
     def _drain_stderr() -> None:
         if not _proc or not _proc.stderr:

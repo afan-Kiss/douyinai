@@ -61,10 +61,22 @@ def test_oneshot_exit_does_not_global_kill() -> None:
     assert (before.stdout or "").strip() == (after.stdout or "").strip()
 
 
+def test_kill_returns_structured_report() -> None:
+    proc = _run_py(
+        "from pigeon_protocol.process_guard import process_cleanup; "
+        "import json; print(json.dumps(process_cleanup(kill_all=False)))"
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads((proc.stdout or "").strip())
+    assert "killed" in data
+    assert "failed" in data or data.get("mode") == "noop"
+
+
 def main() -> int:
     test_registry_json_valid()
     test_concurrent_process_status()
     test_oneshot_exit_does_not_global_kill()
+    test_kill_returns_structured_report()
     print("process_guard smoke: PASS")
     return 0
 

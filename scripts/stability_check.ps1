@@ -132,6 +132,41 @@ function Get-ProcessSnapshot {
     }
 }
 
+function Get-ApiLatencySeverity {
+    param(
+        [string]$Label,
+        [int]$ElapsedMs,
+        [bool]$Ok
+    )
+    if (-not $Ok) { return 'fail' }
+    $key = $Label
+    if ($key -eq 'conversations_light') { $key = 'conversations' }
+    if ($key -eq 'session_light') { $key = 'session' }
+    if ($key -eq 'conversations') {
+        if ($ElapsedMs -gt 8000) { return 'fail' }
+        if ($ElapsedMs -gt 3000) { return 'warn' }
+        return 'pass'
+    }
+    if ($ElapsedMs -gt 1000) { return 'warn' }
+    return 'pass'
+}
+
+function Measure-LatencyStats {
+    param([int[]]$Samples)
+    if (-not $Samples -or $Samples.Count -eq 0) {
+        return @{ avg_ms = 0; p95_ms = 0; max_ms = 0 }
+    }
+    $sorted = @($Samples | Sort-Object)
+    $idx = [math]::Ceiling(0.95 * $sorted.Count) - 1
+    if ($idx -lt 0) { $idx = 0 }
+    if ($idx -ge $sorted.Count) { $idx = $sorted.Count - 1 }
+    return @{
+        avg_ms = [int][math]::Round(($sorted | Measure-Object -Average).Average)
+        p95_ms = [int]$sorted[$idx]
+        max_ms = [int]$sorted[-1]
+    }
+}
+
 function Invoke-ApiCheck {
     param(
         [string]$Path,
@@ -153,6 +188,7 @@ function Invoke-ApiCheck {
             elapsed_ms = 0
             error      = ''
             summary    = ''
+            severity   = 'fail'
             attempts   = $attempt
         }
         try {
@@ -176,6 +212,7 @@ function Invoke-ApiCheck {
                     if ($body -match '"ok"\s*:\s*true') {
                         $item.ok = $true
                         $item.summary = 'ok_regex'
+                        $item.severity = Get-ApiLatencySeverity -Label $Label -ElapsedMs $item.elapsed_ms -Ok $true
                     }
                     else {
                         $item.error = "json parse: $($_.Exception.Message)"
@@ -209,11 +246,13 @@ function Invoke-ApiCheck {
                 else {
                     $item.summary = 'json_ok'
                 }
+                $item.severity = Get-ApiLatencySeverity -Label $Label -ElapsedMs $item.elapsed_ms -Ok $item.ok
                 return $item
             }
             else {
                 $item.error = "HTTP $code"
                 if ($body) { $item.error += ": $($body.Substring(0, [Math]::Min(180, $body.Length)))" }
+                $item.severity = 'fail'
                 if ($attempt -le $Retries) { continue }
                 return $item
             }
@@ -342,19 +381,24 @@ function Invoke-StressSuite {
     foreach ($case in $cases) {
         $okCount = 0
         $failCount = 0
-        $maxMs = 0
+        $times = @()
         for ($i = 1; $i -le $Rounds; $i++) {
             $hit = Invoke-ApiCheck -Path $case.path -Label $case.label
+            $times += [int]$hit.elapsed_ms
             if ($hit.ok) { $okCount++ } else { $failCount++ }
-            if ($hit.elapsed_ms -gt $maxMs) { $maxMs = $hit.elapsed_ms }
         }
+        $stats = Measure-LatencyStats -Samples $times
+        $severity = if ($failCount -gt 0) { 'fail' } else { Get-ApiLatencySeverity -Label $case.label -ElapsedMs $stats.max_ms -Ok $true }
         $results += [ordered]@{
             label      = $case.label
             rounds     = $Rounds
             ok         = $okCount
             fail       = $failCount
-            max_ms     = $maxMs
-            pass       = ($failCount -eq 0)
+            avg_ms     = $stats.avg_ms
+            p95_ms     = $stats.p95_ms
+            max_ms     = $stats.max_ms
+            severity   = $severity
+            pass       = ($severity -ne 'fail')
         }
     }
 
@@ -429,15 +473,20 @@ if ($RunStress) {
     }
 }
 
-$apiPass = -not @($apiChecks | Where-Object { -not $_.ok }).Count
+$apiPass = -not @($apiChecks | Where-Object { $_.severity -eq 'fail' }).Count
 $limitPass = -not @($limitChecks | Where-Object { -not $_.pass }).Count
 $stressPass = $true
+$hasWarn = @($apiChecks | Where-Object { $_.severity -eq 'warn' }).Count -gt 0
 if ($stress) {
-    $stressPass = ($stress.cases | Where-Object { -not $_.pass }).Count -eq 0 -and [bool]$stress.growth.pass
+    $stressPass = ($stress.cases | Where-Object { $_.severity -eq 'fail' }).Count -eq 0 -and [bool]$stress.growth.pass
+    if (@($stress.cases | Where-Object { $_.severity -eq 'warn' }).Count -gt 0) { $hasWarn = $true }
 }
+$hasFail = -not ($apiPass -and $limitPass -and $stressPass)
+$overallSeverity = if ($hasFail) { 'fail' } elseif ($hasWarn) { 'warn' } else { 'pass' }
 
 $report = [ordered]@{
-    ok           = ($apiPass -and $limitPass -and $stressPass)
+    ok           = (-not $hasFail)
+    severity     = $overallSeverity
     project_root = $Root
     base_url     = $BaseUrl
     timestamp    = (Get-Date).ToString('o')
@@ -469,8 +518,8 @@ else {
     Write-Host ''
     Write-Host '[API]' -ForegroundColor Yellow
     foreach ($a in $apiChecks) {
-        $mark = if ($a.ok) { 'PASS' } else { 'FAIL' }
-        $color = if ($a.ok) { 'Green' } else { 'Red' }
+        $mark = switch ($a.severity) { 'warn' { 'WARN' } 'fail' { 'FAIL' } default { 'PASS' } }
+        $color = switch ($a.severity) { 'warn' { 'Yellow' } 'fail' { 'Red' } default { 'Green' } }
         Write-Host ("  [{0}] {1} {2}ms {3} {4}" -f $mark, $a.label, $a.elapsed_ms, $a.summary, $(if ($a.error) { $a.error } else { '' })) -ForegroundColor $color
     }
     Write-Host ''
@@ -484,9 +533,9 @@ else {
         Write-Host ''
         Write-Host "[Stress x$StressRounds]" -ForegroundColor Yellow
         foreach ($s in $stress.cases) {
-            $mark = if ($s.pass) { 'PASS' } else { 'FAIL' }
-            $color = if ($s.pass) { 'Green' } else { 'Red' }
-            Write-Host ("  [{0}] {1}: ok={2} fail={3} max={4}ms" -f $mark, $s.label, $s.ok, $s.fail, $s.max_ms) -ForegroundColor $color
+            $mark = switch ($s.severity) { 'warn' { 'WARN' } 'fail' { 'FAIL' } default { 'PASS' } }
+            $color = switch ($s.severity) { 'warn' { 'Yellow' } 'fail' { 'Red' } default { 'Green' } }
+            Write-Host ("  [{0}] {1}: ok={2} fail={3} avg={4}ms p95={5}ms max={6}ms" -f $mark, $s.label, $s.ok, $s.fail, $s.avg_ms, $s.p95_ms, $s.max_ms) -ForegroundColor $color
         }
         $g = $stress.growth
         $gmark = if ($g.pass) { 'PASS' } else { 'FAIL' }
@@ -494,13 +543,12 @@ else {
         Write-Host ("  [{0}] growth feige+{1} python+{2} node+{3}" -f $gmark, $g.feige_delta, $g.python_delta, $g.node_delta) -ForegroundColor $gcolor
     }
     Write-Host ''
-    if ($report.ok) {
-        Write-Host 'OVERALL: PASS' -ForegroundColor Green
-    }
-    else {
-        Write-Host 'OVERALL: FAIL' -ForegroundColor Red
+    switch ($overallSeverity) {
+        'warn' { Write-Host 'OVERALL: WARN' -ForegroundColor Yellow }
+        'fail' { Write-Host 'OVERALL: FAIL' -ForegroundColor Red }
+        default { Write-Host 'OVERALL: PASS' -ForegroundColor Green }
     }
 }
 
-if (-not $report.ok) { exit 1 }
+if ($overallSeverity -eq 'fail') { exit 1 }
 exit 0

@@ -263,6 +263,8 @@ def list_registered_processes(kind: str = "node") -> list[dict[str, Any]]:
                 "alive": alive,
                 "created_at": int(row.get("created_at") or 0),
                 "owner_pid": int(row.get("owner_pid") or 0),
+                "last_kill_failed_at": int(row.get("last_kill_failed_at") or 0),
+                "last_kill_error": str(row.get("last_kill_error") or ""),
             }
         )
     return out
@@ -290,60 +292,111 @@ def _kill_pid(pid: int) -> bool:
         return False
 
 
-def kill_registered_processes(kind: str = "node", older_than_sec: int | None = None) -> int:
+def kill_registered_processes(kind: str = "node", older_than_sec: int | None = None) -> dict[str, Any]:
     """Kill registered PIDs only — never scans arbitrary node.exe."""
     cleanup_dead_registered_processes()
     now = int(time.time())
-    killed = 0
-    to_kill: list[int] = []
+    targets: list[dict[str, Any]] = []
 
     with _registry_file_lock(block=True):
         doc = _read_registry_unlocked()
-        keep: list[dict[str, Any]] = []
         for row in doc.get("processes") or []:
             if not isinstance(row, dict):
                 continue
             row_kind = str(row.get("kind") or "node")
             if kind and row_kind != kind:
-                keep.append(row)
                 continue
             pid = int(row.get("pid") or 0)
             created = int(row.get("created_at") or 0)
             age = now - created if created else 0
             if older_than_sec is not None and age < int(older_than_sec):
-                keep.append(row)
                 continue
             if pid > 0 and _pid_alive(pid):
-                to_kill.append(pid)
-            _local_registered.discard(pid)
-        doc["processes"] = keep
-        _write_registry_unlocked(doc)
+                targets.append(dict(row))
 
-    for pid in to_kill:
-        if _kill_pid(pid):
+    killed = 0
+    failed = 0
+    kill_results: dict[int, tuple[bool, str]] = {}
+    for row in targets:
+        pid = int(row.get("pid") or 0)
+        if pid <= 0:
+            continue
+        _kill_pid(pid)
+        if _pid_alive(pid):
+            failed += 1
+            kill_results[pid] = (False, "kill_failed_still_alive")
+        else:
             killed += 1
-    if killed:
-        logger.info("kill_registered_processes kind=%s killed=%d", kind, killed)
-    return killed
+            kill_results[pid] = (True, "")
+            _local_registered.discard(pid)
+
+    if kill_results:
+        def _mut(doc: dict[str, Any]) -> None:
+            keep: list[dict[str, Any]] = []
+            for row in doc.get("processes") or []:
+                if not isinstance(row, dict):
+                    continue
+                pid = int(row.get("pid") or 0)
+                if pid not in kill_results:
+                    keep.append(row)
+                    continue
+                success, err = kill_results[pid]
+                if success or not _pid_alive(pid):
+                    continue
+                updated = dict(row)
+                updated["last_kill_failed_at"] = now
+                updated["last_kill_error"] = err
+                keep.append(updated)
+            doc["processes"] = keep
+
+        _mutate_registry(_mut)
+
+    if killed or failed:
+        logger.info("kill_registered_processes kind=%s killed=%d failed=%d", kind, killed, failed)
+    return {"ok": True, "killed": killed, "failed": failed}
+
+
+def kill_actual_project_nodes_not_registered() -> dict[str, Any]:
+    """Global cleanup only — kill project node.exe not present in registry."""
+    registered = {int(r.get("pid") or 0) for r in list_registered_processes(kind="node")}
+    pids, scan_ok = scan_actual_project_node_pids()
+    killed_unregistered = 0
+    if not scan_ok:
+        return {"killed_unregistered": 0, "actual_scan_ok": False}
+
+    for pid in pids:
+        if pid in registered or pid <= 0 or not _pid_alive(pid):
+            continue
+        _kill_pid(pid)
+        if not _pid_alive(pid):
+            killed_unregistered += 1
+
+    cleanup_dead_registered_processes()
+    return {"killed_unregistered": killed_unregistered, "actual_scan_ok": True}
 
 
 def kill_local_registered_processes(kind: str = "node") -> int:
     """Kill only PIDs registered by this Python process (_local_registered)."""
-    pids = sorted(int(p) for p in _local_registered if int(p) > 0)
+    pids = sorted(int(p) for p in list(_local_registered) if int(p) > 0)
     if not pids:
         return 0
     killed = 0
+    dead_pids: set[int] = set()
     for pid in pids:
-        if _pid_alive(pid) and _kill_pid(pid):
+        if _pid_alive(pid):
+            _kill_pid(pid)
+        if not _pid_alive(pid):
             killed += 1
-        _local_registered.discard(pid)
+            dead_pids.add(pid)
+            _local_registered.discard(pid)
 
-    pid_set = set(pids)
+    if dead_pids:
 
-    def _mut(doc: dict[str, Any]) -> None:
-        doc["processes"] = [p for p in doc.get("processes") or [] if int(p.get("pid") or 0) not in pid_set]
+        def _mut(doc: dict[str, Any]) -> None:
+            doc["processes"] = [p for p in doc.get("processes") or [] if int(p.get("pid") or 0) not in dead_pids]
 
-    _mutate_registry(_mut)
+        _mutate_registry(_mut)
+
     if killed:
         logger.info("kill_local_registered_processes kind=%s killed=%d", kind, killed)
     return killed
@@ -439,15 +492,27 @@ def process_status() -> dict[str, Any]:
 
 def cleanup_stale_nodes(*, older_than_sec: int, reason: str = "") -> dict[str, Any]:
     cleanup_dead_registered_processes()
-    killed = kill_registered_processes(kind="node", older_than_sec=int(older_than_sec))
-    return {"ok": True, "killed": killed, "mode": "stale", "reason": reason}
+    report = kill_registered_processes(kind="node", older_than_sec=int(older_than_sec))
+    report["mode"] = "stale"
+    report["reason"] = reason
+    return report
 
 
 def cleanup_global_nodes(*, reason: str = "") -> dict[str, Any]:
     cleanup_dead_registered_processes()
-    killed = kill_registered_processes(kind="node", older_than_sec=None)
+    report = kill_registered_processes(kind="node", older_than_sec=None)
+    extra = kill_actual_project_nodes_not_registered()
     release_bdms_daemon_lock()
-    return {"ok": True, "killed": killed, "mode": "global", "reason": reason}
+    cleanup_dead_registered_processes()
+    return {
+        "ok": True,
+        "killed": int(report.get("killed") or 0),
+        "failed": int(report.get("failed") or 0),
+        "killed_unregistered": int(extra.get("killed_unregistered") or 0),
+        "actual_scan_ok": bool(extra.get("actual_scan_ok")),
+        "mode": "global",
+        "reason": reason,
+    }
 
 
 def process_cleanup(*, kill_all: bool = False, older_than_sec: int | None = None) -> dict[str, Any]:
@@ -456,7 +521,7 @@ def process_cleanup(*, kill_all: bool = False, older_than_sec: int | None = None
     if older_than_sec is not None:
         return cleanup_stale_nodes(older_than_sec=int(older_than_sec), reason="process_cleanup")
     cleanup_dead_registered_processes()
-    return {"ok": True, "killed": 0, "mode": "noop"}
+    return {"ok": True, "killed": 0, "failed": 0, "mode": "noop"}
 
 
 # --- bdms daemon cross-process lock ---
