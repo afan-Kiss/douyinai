@@ -103,6 +103,7 @@
   const CS_MODE = true;
 
   function resetWorkspaceState() {
+    state.eventSince = 0;
     state.conversations = [];
     state.convMeta = {};
     state.currentUid = "";
@@ -401,7 +402,7 @@
       renderLogin(j);
       if (state.loggedIn) {
         if (forceConv || state.conversations.length === 0 || state.activeCategory === "recent") {
-          await refreshConversations(forceConv, state.activeCategory, { heavy: forceConv });
+          await refreshConversations(forceConv, state.activeCategory || "recent", { heavy: false });
         }
         await syncListenStatus();
         if (!state.listenOn && j.listen_ready !== false) {
@@ -415,10 +416,13 @@
 
   function accountPickerLabel(a) {
     const shop = String(a.shop_id || "").trim();
+    const shopName = String(a.shop_name || "").trim();
     const label = String(a.label || "").trim();
     if (a.is_empty_slot || label === "扫码登录新店铺") return "扫码登录新店铺";
-    if (shop) return `店铺 ${shop}`;
-    if (label && label !== "空账号槽" && !/^acct_[0-9a-f]+$/i.test(label)) return label;
+    const looksLikeId = (v) => !v || v === shop || /^店铺\s*\d+$/.test(v) || /^shop_\d+$/i.test(v) || /^acct_[0-9a-f]+$/i.test(v);
+    if (shopName && !looksLikeId(shopName)) return shopName;
+    if (label && label !== "空账号槽" && !looksLikeId(label)) return label;
+    if (shop) return shop; // last resort: raw id without「店铺」prefix
     return "扫码登录新店铺";
   }
 
@@ -467,9 +471,10 @@
     const same = accountId === state.activeAccountId;
     if (same && !preserveQr) {
       toast("正在刷新当前账号…");
-      await refreshLogin(true);
+      state.eventSince = 0;
+      await refreshLogin(false);
       if (isActiveAccountLoggedIn()) {
-        await refreshConversations(true);
+        await refreshConversations(true, state.activeCategory || "recent", { heavy: false });
       }
       return;
     }
@@ -486,8 +491,9 @@
         trackProgress: !preserveQr,
       });
       if (!preserveQr) {
-        await refreshLogin(true);
-        await refreshConversations(true);
+        state.eventSince = 0;
+        await refreshLogin(false);
+        await refreshConversations(true, state.activeCategory || "recent", { heavy: false });
         toast("已切换账号");
       } else {
         state.activeAccountId = accountId;
@@ -519,15 +525,46 @@
     return ["bootstrapping", "logged_in", "scanned"].includes(qr.phase || "");
   }
 
+  async function logoutCurrentAccount() {
+    if (!state.loggedIn && !state.activeAccountId) return;
+    if (!confirm("确定退出当前店铺吗？退出后该店铺需要重新扫码登录。")) return;
+    try {
+      const j = await api("/api/accounts/logout", {
+        method: "POST",
+        body: JSON.stringify({ account_id: state.activeAccountId || "" }),
+        trackProgress: true,
+      });
+      if (j.ok === false) {
+        toast("退出失败: " + (j.error || "未知错误"));
+        return;
+      }
+      stopQrPoll();
+      resetWorkspaceState();
+      state.listenOn = false;
+      _lastLoginRenderKey = "";
+      await refreshLogin(false);
+      renderAccountPicker();
+      const switched = j.switched_to || j.active_account_id || "";
+      if (switched && j.logged_in) {
+        await refreshConversations(false, "recent", { heavy: false });
+      }
+      toast("已退出当前店铺");
+    } catch (e) {
+      toast("退出失败: " + (e.message || e));
+    }
+  }
+
   async function completeQrLoginSuccess(j) {
     stopQrPoll();
-    const sendOk = j.send_ready !== false;
-    toast(sendOk ? "登录成功，发信已就绪" : "登录成功，正在预热协议…");
-    if (j.blockers?.length && !sendOk) toast(j.blockers[0], 6000);
+    const sendOk = j.send_ready === true;
+    toast(
+      sendOk ? "登录成功，已进入客服工作台" : "登录成功，协议后台预热中，不影响查看会话"
+    );
     _lastLoginRenderKey = "";
     state.loggedIn = true;
     state.loginPhase = "logged_in";
-    await refreshLogin(true);
+    await refreshLogin(false);
+    await refreshConversations(true, "recent", { heavy: false });
     if (state.loggedIn) {
       if (j.listen_ready !== false) await startListening();
     }
@@ -616,9 +653,11 @@
         </div>
         <div class="btn-row">
           <button type="button" class="btn ghost" id="btnReQrLogin">切换店铺 / 扫码登录</button>
+          <button type="button" class="btn ghost warn sm" id="btnLogoutShop">退出当前店铺</button>
           ${fixBtn}
         </div>`;
       $("btnReQrLogin")?.addEventListener("click", startQrLogin);
+      $("btnLogoutShop")?.addEventListener("click", () => void logoutCurrentAccount());
       $("btnStartQr")?.addEventListener("click", startQrLogin);
       $("btnReOnboard")?.addEventListener("click", startCdpOnboard);
       $("btnWarmInners")?.addEventListener("click", startCdpWarm);
@@ -645,7 +684,7 @@
       fetching: ["正在获取二维码", "请稍候…", null],
       waiting_scan: ["等待扫码", "请用抖音/抖店 App 扫码（约 60 秒自动换新码）", "btnRefreshQr"],
       scanned: ["已扫码", "请在手机上确认登录（确认后请稍候）", null],
-      bootstrapping: ["正在完成登录", "正在写入会话并预热协议…", null],
+      bootstrapping: ["正在完成登录", "正在写入会话…", null],
       expired: ["二维码已过期", "点击下方按钮刷新", "btnRefreshQr"],
       error: ["登录失败", qr.error || "请重试", "btnRefreshQr"],
       logged_in: ["登录成功", "正在同步会话…", null],
@@ -1391,8 +1430,13 @@
         toast((j.reason || "发信未就绪") + " — 可点击预热发信", 6000);
         setAiState("fail", "需预热 169B 发信密钥");
       } else if (j.preflight_failed) {
-        toast(j.reason || j.blockers?.[0] || "发信未就绪", 5000);
-        setAiState("fail", "发信未就绪");
+        toast(
+          CS_MODE
+            ? "当前店铺发信通道还在准备中，请稍后再试或点击高级修复"
+            : j.reason || j.blockers?.[0] || "发信未就绪",
+          5000
+        );
+        setAiState("fail", CS_MODE ? "发信通道准备中" : "发信未就绪");
       } else {
         toast("发送失败: " + (j.reason || "请重试"));
         setAiState("fail", "发送没成功，点发送再试一次");
@@ -1409,7 +1453,8 @@
   async function pollEvents() {
     if (!state.listenOn) return;
     try {
-      const j = await api("/api/events?since=" + state.eventSince, BG_API);
+      const q = `/api/events?since=${state.eventSince}&account_id=${encodeURIComponent(state.activeAccountId || "")}`;
+      const j = await api(q, BG_API);
       if (j.ok === false) {
         _eventFailCount += 1;
         if (_eventFailCount >= 3) {
@@ -1424,6 +1469,10 @@
       }
       _eventFailCount = 0;
       (j.items || []).forEach((e) => {
+        const eventAccount = e.account_id || "";
+        if (eventAccount && state.activeAccountId && eventAccount !== state.activeAccountId) {
+          return;
+        }
         state.eventSince = e.seq;
         if (e.kind === "message" && e.message) {
           const m = e.message;
@@ -1510,14 +1559,15 @@
 
     $("btnRefreshAll").addEventListener("click", () =>
       withBtnLoading($("btnRefreshAll"), async () => {
-        await refreshLogin(true);
+        await refreshLogin(false);
         if (state.loggedIn) {
-          await refreshConversations(true, state.activeCategory, { heavy: false });
+          await refreshConversations(true, state.activeCategory || "recent", { heavy: false });
           if (state.currentUid) await selectConversation(state.currentUid);
         }
         toast("已刷新");
       })
     );
+    $("btnLogoutAccount")?.addEventListener("click", () => void logoutCurrentAccount());
     $("accountSelect")?.addEventListener("change", (e) => {
       const id = e.target.value;
       if (!id) {

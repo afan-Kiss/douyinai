@@ -1,12 +1,15 @@
 """Conversation list via xundan_chat_list — uses foundation relay layer."""
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlencode
+
+_conv_light_ctx: contextvars.ContextVar[bool] = contextvars.ContextVar("conv_light", default=False)
 
 logger = logging.getLogger("pigeon.conv_list")
 
@@ -42,18 +45,25 @@ def _load_conv_template() -> dict[str, Any]:
     return {}
 
 
-def _resolve_whale_params(session) -> dict[str, str]:
+def _resolve_whale_params(session, *, light: bool | None = None) -> dict[str, str]:
     """Live gfdatav1.ver → E.AM() whale `_v` + verifyFp (captcha fp)."""
     from pigeon_protocol.foundation.bdms_tokens import verify_fp_from_cookies
-    from pigeon_protocol.whale_version import resolve_whale_versions
 
+    use_light = _conv_light_ctx.get() if light is None else light
     cached = {
         "whale_v": str((session.query_tokens or {}).get("whale_v") or ""),
         "im_pc_version": str((session.query_tokens or {}).get("im_pc_version") or ""),
     }
-    vers = resolve_whale_versions(session=session)
-    whale_v = vers.get("whale_v") or cached["whale_v"] or "1.0.1.7626"
-    im_pc = vers.get("im_pc_version") or cached["im_pc_version"] or ""
+    vers: dict[str, str] = {}
+    if use_light:
+        whale_v = cached["whale_v"] or "1.0.1.7626"
+        im_pc = cached["im_pc_version"]
+    else:
+        from pigeon_protocol.whale_version import resolve_whale_versions
+
+        vers = resolve_whale_versions(session=session)
+        whale_v = vers.get("whale_v") or cached["whale_v"] or "1.0.1.7626"
+        im_pc = vers.get("im_pc_version") or cached["im_pc_version"] or ""
 
     if session is not None:
         session.query_tokens["whale_v"] = whale_v
@@ -75,11 +85,11 @@ def _resolve_whale_params(session) -> dict[str, str]:
     return out
 
 
-def _unsigned_url(*, queue_key: str = "no_order", page_size: int = 20, session=None) -> str:
+def _unsigned_url(*, queue_key: str = "no_order", page_size: int = 20, session=None, light: bool | None = None) -> str:
     from pigeon_protocol.config import PIGEON_HOST, XUNDAN_CHAT_LIST_PATH
 
     tpl = _load_conv_template()
-    whale = _resolve_whale_params(session)
+    whale = _resolve_whale_params(session, light=light)
     params = {
         "biz_type": "4",
         "PIGEON_BIZ_TYPE": "2",
@@ -182,186 +192,278 @@ def warm_conv_session(session) -> dict[str, Any]:
     return report
 
 
+def _relay_get_light(session, unsigned_url: str, *, via: str, timeout_sec: float, queue_key: str = "") -> dict[str, Any]:
+    from pigeon_protocol.foundation.bdms_sign import persist_tokens_to_session, sign_backstage_url
+    from pigeon_protocol.foundation.bdms_tokens import persist_ms_token_from_response
+    from pigeon_protocol.foundation.types import RelayResponse
+    from pigeon_protocol.http_client import DEFAULT_CURL_IMPERSONATE
+    from pigeon_protocol.http_transport import curl_cffi_available, request_json
+    from pigeon_protocol.order_relay_headers import build_order_relay_headers
+    from pigeon_protocol.whale_urls import is_whale_backstage_url
+
+    if not curl_cffi_available():
+        return {"ok": False, "error": "relay unavailable", "via": via}
+
+    def _once(*, force_csrf: bool) -> dict[str, Any]:
+        sign = sign_backstage_url(unsigned_url, method="GET", prefer_python=not force_csrf)
+        if not sign.ok:
+            return {"ok": False, "error": sign.error or "sign failed", "via": via}
+
+        persist_tokens_to_session(session, sign)
+        hdr = build_order_relay_headers(session, force_refresh=force_csrf, for_method="GET")
+        im_ver = str(session.query_tokens.get("im_pc_version") or "")
+        if im_ver:
+            hdr["X-IM-PC-Version"] = im_ver
+
+        try:
+            raw = request_json(
+                "GET",
+                sign.signed_url,
+                headers=hdr,
+                transport="curl_cffi",
+                impersonate=DEFAULT_CURL_IMPERSONATE,
+                timeout=timeout_sec,
+            )
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "via": via, "timeout": True}
+
+        persist_ms_token_from_response(session, raw.get("headers") if isinstance(raw.get("headers"), dict) else None)
+        relay = RelayResponse(
+            ok=bool(raw.get("ok")),
+            status=int(raw.get("status") or 0),
+            data=raw.get("data") if isinstance(raw.get("data"), dict) else {"payload": raw.get("data")},
+            via=f"{via}/csrf_retry" if force_csrf else via,
+            url=str(raw.get("url") or sign.signed_url),
+            headers={k: str(v) for k, v in (raw.get("headers") or {}).items()},
+            sign=sign,
+        )
+        if isinstance(raw.get("data"), dict):
+            relay.data = raw["data"]
+        if relay.api_code():
+            relay.ok = relay.api_ok()
+        else:
+            relay.ok = bool(raw.get("ok")) and relay.status == 200
+        return _relay_to_legacy(relay, queue_key=queue_key)
+
+    last_raw = _once(force_csrf=False)
+    data = last_raw.get("data") if isinstance(last_raw.get("data"), dict) else {}
+    if (
+        not last_raw.get("ok")
+        and str(data.get("code") or data.get("st") or "") == "11001"
+        and is_whale_backstage_url(unsigned_url)
+        and not last_raw.get("timeout")
+    ):
+        retry = _once(force_csrf=True)
+        if retry.get("ok") or parse_conversation_items(retry):
+            return retry
+    return last_raw
+
+
 def list_conversations_relay(
     session,
     *,
     page: int = 0,
     size: int = 30,
     queue_keys: tuple[str, ...] | None = None,
+    skip_warm: bool = False,
+    request_timeout_sec: float | None = None,
+    snapshot_only: bool = False,
 ) -> dict[str, Any]:
     from pigeon_protocol.config import XUNDAN_QUEUE_KEYS
     from pigeon_protocol.foundation.relay_client import BackstageRelayClient
     from pigeon_protocol.pure_config import pure_only_mode
 
-    warm_conv_session(session)
+    light_token = _conv_light_ctx.set(True) if skip_warm else None
+    try:
+        if not skip_warm:
+            warm_conv_session(session)
 
-    keys = queue_keys or XUNDAN_QUEUE_KEYS
-    merged_items: list[dict[str, Any]] = []
-    seen_uids: set[str] = set()
-    last_raw: dict[str, Any] = {}
+        keys = queue_keys or XUNDAN_QUEUE_KEYS
+        merged_items: list[dict[str, Any]] = []
+        seen_uids: set[str] = set()
+        last_raw: dict[str, Any] = {}
 
-    try_snapshot = pure_only_mode() or os.getenv("PIGEON_CONV_SNAPSHOT", "").strip().lower() in ("1", "true", "yes")
-    if try_snapshot:
-        try:
-            from pigeon_protocol.conv_sign_snapshot import fetch_xundan_via_snapshot, has_fresh_snapshot
-
-            if has_fresh_snapshot():
-                snap_attempts: list[dict[str, Any]] = []
-                for queue_key in keys:
-                    snap = fetch_xundan_via_snapshot(session, queue_key=queue_key, page_size=size)
-                    snap_attempts.append(
-                        {
-                            "queue_key": queue_key,
-                            "ok": bool(snap and snap.get("ok")),
-                            "code": (snap or {}).get("api_code"),
-                            "items": len((snap or {}).get("items") or []),
-                        }
-                    )
-                    if not snap or not snap.get("items"):
-                        continue
-                    for item in snap["items"]:
-                        uid = item.get("security_user_id") or ""
-                        if uid and uid in seen_uids:
-                            continue
-                        if uid:
-                            seen_uids.add(uid)
-                        item["queue_key"] = queue_key
-                        merged_items.append(item)
-                if merged_items:
-                    return {
-                        "ok": True,
-                        "items": merged_items,
-                        "data": {"code": 0, "data": {"user_list": merged_items}},
-                        "via": "conv_list/xundan_snapshot",
-                        "queues_scanned": list(keys),
-                        "snapshot_attempts": snap_attempts,
-                    }
-                last_raw["snapshot_attempts"] = snap_attempts
-        except Exception as exc:
-            logger.debug("conv snapshot path skipped: %s", exc)
-
-    client = BackstageRelayClient(session)
-    if not client.available():
-        return {"ok": False, "error": "relay unavailable"}
-
-    for queue_key in keys:
-        unsigned = _unsigned_url(queue_key=queue_key, page_size=size, session=session)
-        relay = client.get(unsigned, via=f"conv_list/xundan/{queue_key}")
-        last_raw = _relay_to_legacy(relay, queue_key=queue_key)
-
-        if not relay.api_ok():
-            continue
-        for item in parse_conversation_items(last_raw):
-            uid = item.get("security_user_id") or ""
-            if uid and uid in seen_uids:
-                continue
-            if uid:
-                seen_uids.add(uid)
-            item["queue_key"] = queue_key
-            merged_items.append(item)
-
-    if merged_items:
-        return {
-            "ok": True,
-            "items": merged_items,
-            "data": {"code": 0, "data": {"user_list": merged_items}},
-            "via": last_raw.get("via", "conv_list/xundan"),
-            "queues_scanned": list(keys),
-        }
-
-    if last_raw:
-        data = last_raw.get("data") if isinstance(last_raw.get("data"), dict) else {}
-        api_code = str(data.get("code") or data.get("st") or "")
-        if api_code == "11001":
-            msg = str(data.get("msg") or "")
+        try_snapshot = pure_only_mode() or os.getenv("PIGEON_CONV_SNAPSHOT", "").strip().lower() in ("1", "true", "yes")
+        if try_snapshot or skip_warm:
             try:
-                msg = msg.encode("latin-1").decode("utf-8")
-            except (UnicodeDecodeError, UnicodeEncodeError):
-                pass
+                from pigeon_protocol.conv_sign_snapshot import fetch_xundan_via_snapshot, has_fresh_snapshot
 
-            if os.getenv("PIGEON_NO_CDP", "").strip().lower() not in ("1", "true", "yes"):
-                try:
-                    from pigeon_protocol.conv_xundan_curl_relay import fetch_xundan_via_curl_relay
-
-                    curl_items: list[dict[str, Any]] = []
-                    curl_attempts: list[dict[str, Any]] = []
-                    for qk in keys:
-                        curl = fetch_xundan_via_curl_relay(session, queue_key=qk, page_size=size)
-                        curl_attempts.append(
+                if has_fresh_snapshot():
+                    snap_attempts: list[dict[str, Any]] = []
+                    for queue_key in keys:
+                        snap = fetch_xundan_via_snapshot(session, queue_key=queue_key, page_size=size)
+                        snap_attempts.append(
                             {
-                                "queue_key": qk,
-                                "ok": curl.get("ok"),
-                                "code": curl.get("api_code"),
-                                "items": len(curl.get("items") or []),
+                                "queue_key": queue_key,
+                                "ok": bool(snap and snap.get("ok")),
+                                "code": (snap or {}).get("api_code"),
+                                "items": len((snap or {}).get("items") or []),
                             }
                         )
-                        if curl.get("items"):
-                            for it in curl["items"]:
-                                it["queue_key"] = qk
-                            curl_items.extend(curl["items"])
-                    if curl_items:
+                        if not snap or not snap.get("items"):
+                            continue
+                        for item in snap["items"]:
+                            uid = item.get("security_user_id") or ""
+                            if uid and uid in seen_uids:
+                                continue
+                            if uid:
+                                seen_uids.add(uid)
+                            item["queue_key"] = queue_key
+                            merged_items.append(item)
+                    if merged_items:
                         return {
                             "ok": True,
-                            "items": curl_items,
-                            "via": "conv_list/xundan_curl_relay",
-                            "xundan_error": msg or "whale_block:11001",
-                            "curl_relay_attempts": curl_attempts,
+                            "items": merged_items,
+                            "data": {"code": 0, "data": {"user_list": merged_items}},
+                            "via": "conv_list/xundan_snapshot",
+                            "queues_scanned": list(keys),
+                            "snapshot_attempts": snap_attempts,
                         }
-                    last_raw["curl_relay_attempts"] = curl_attempts
-                except Exception as exc:
-                    logger.warning("conv_list curl relay failed: %s", exc)
-                    last_raw["curl_relay_error"] = str(exc)
+                    last_raw["snapshot_attempts"] = snap_attempts
+            except Exception as exc:
+                logger.debug("conv snapshot path skipped: %s", exc)
 
+        if snapshot_only:
+            return last_raw or {"ok": False, "error": "snapshot unavailable", "items": []}
+
+        client = BackstageRelayClient(session)
+        if not client.available():
+            return {"ok": False, "error": "relay unavailable"}
+
+        for queue_key in keys:
+            unsigned = _unsigned_url(queue_key=queue_key, page_size=size, session=session, light=skip_warm)
+            if request_timeout_sec is not None:
+                last_raw = _relay_get_light(
+                    session,
+                    unsigned,
+                    via=f"conv_list/xundan/{queue_key}",
+                    timeout_sec=request_timeout_sec,
+                    queue_key=queue_key,
+                )
+                api_ok = bool(last_raw.get("ok"))
+            else:
+                relay = client.get(unsigned, via=f"conv_list/xundan/{queue_key}")
+                last_raw = _relay_to_legacy(relay, queue_key=queue_key)
+                api_ok = relay.api_ok()
+
+            if not api_ok:
+                if last_raw.get("timeout"):
+                    break
+                continue
+            for item in parse_conversation_items(last_raw):
+                uid = item.get("security_user_id") or ""
+                if uid and uid in seen_uids:
+                    continue
+                if uid:
+                    seen_uids.add(uid)
+                item["queue_key"] = queue_key
+                merged_items.append(item)
+
+        if merged_items:
+            return {
+                "ok": True,
+                "items": merged_items,
+                "data": {"code": 0, "data": {"user_list": merged_items}},
+                "via": last_raw.get("via", "conv_list/xundan"),
+                "queues_scanned": list(keys),
+            }
+
+        if last_raw:
+            data = last_raw.get("data") if isinstance(last_raw.get("data"), dict) else {}
+            api_code = str(data.get("code") or data.get("st") or "")
+            if api_code == "11001" and not skip_warm:
+                msg = str(data.get("msg") or "")
                 try:
-                    from pigeon_protocol.conv_list_cdp import list_conversations_cdp
+                    msg = msg.encode("latin-1").decode("utf-8")
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    pass
 
-                    wait_login = float(os.getenv("PIGEON_CDP_WAIT_LOGIN", "45"))
-                    cdp = list_conversations_cdp(
-                        session,
-                        size=size,
-                        queue_keys=keys,
-                        wait_login_sec=wait_login,
-                    )
-                    if cdp.get("ok") and cdp.get("items"):
-                        cdp["xundan_error"] = msg or "whale_block:11001"
-                        return cdp
-                    last_raw["cdp_attempt"] = {
-                        "ok": cdp.get("ok"),
-                        "error": cdp.get("error"),
-                        "attempts": cdp.get("attempts"),
-                    }
-                except Exception as exc:
-                    logger.warning("conv_list CDP failed: %s", exc)
-                    last_raw["cdp_attempt"] = {"error": str(exc)}
+                if os.getenv("PIGEON_NO_CDP", "").strip().lower() not in ("1", "true", "yes"):
+                    try:
+                        from pigeon_protocol.conv_xundan_curl_relay import fetch_xundan_via_curl_relay
 
-            from pigeon_protocol.conv_list_fallback import list_conversations_fallback
+                        curl_items: list[dict[str, Any]] = []
+                        curl_attempts: list[dict[str, Any]] = []
+                        for qk in keys:
+                            curl = fetch_xundan_via_curl_relay(session, queue_key=qk, page_size=size)
+                            curl_attempts.append(
+                                {
+                                    "queue_key": qk,
+                                    "ok": curl.get("ok"),
+                                    "code": curl.get("api_code"),
+                                    "items": len(curl.get("items") or []),
+                                }
+                            )
+                            if curl.get("items"):
+                                for it in curl["items"]:
+                                    it["queue_key"] = qk
+                                curl_items.extend(curl["items"])
+                        if curl_items:
+                            return {
+                                "ok": True,
+                                "items": curl_items,
+                                "via": "conv_list/xundan_curl_relay",
+                                "xundan_error": msg or "whale_block:11001",
+                                "curl_relay_attempts": curl_attempts,
+                            }
+                        last_raw["curl_relay_attempts"] = curl_attempts
+                    except Exception as exc:
+                        logger.warning("conv_list curl relay failed: %s", exc)
+                        last_raw["curl_relay_error"] = str(exc)
 
-            fallback = list_conversations_fallback(session, limit=size)
-            if fallback.get("ok") and fallback.get("items"):
-                fallback["error"] = msg or "xundan whale_block:11001"
-                fallback["xundan_error"] = msg or "whale_block:11001"
-                return fallback
-            last_raw["ok"] = False
-            last_raw["api_code"] = 11001
-            last_raw["error"] = msg or "whale_block:11001"
-            last_raw["whale_v"] = (session.query_tokens or {}).get("whale_v")
-        elif not client.available():
-            last_raw["error"] = last_raw.get("error") or "relay unavailable (need curl_cffi + bdms sign)"
+                    try:
+                        from pigeon_protocol.conv_list_cdp import list_conversations_cdp
 
-    if not merged_items:
-        try:
-            from pigeon_protocol.conv_list_fallback import list_conversations_fallback
+                        wait_login = float(os.getenv("PIGEON_CDP_WAIT_LOGIN", "45"))
+                        cdp = list_conversations_cdp(
+                            session,
+                            size=size,
+                            queue_keys=keys,
+                            wait_login_sec=wait_login,
+                        )
+                        if cdp.get("ok") and cdp.get("items"):
+                            cdp["xundan_error"] = msg or "whale_block:11001"
+                            return cdp
+                        last_raw["cdp_attempt"] = {
+                            "ok": cdp.get("ok"),
+                            "error": cdp.get("error"),
+                            "attempts": cdp.get("attempts"),
+                        }
+                    except Exception as exc:
+                        logger.warning("conv_list CDP failed: %s", exc)
+                        last_raw["cdp_attempt"] = {"error": str(exc)}
 
-            fallback = list_conversations_fallback(session, limit=size)
-            if fallback.get("ok") and fallback.get("items"):
-                if isinstance(last_raw, dict):
-                    fallback["xundan_empty"] = True
-                    fallback["xundan_via"] = last_raw.get("via")
-                return fallback
-        except Exception as exc:
-            logger.debug("conv_list empty xundan fallback: %s", exc)
+                from pigeon_protocol.conv_list_fallback import list_conversations_fallback
 
-    return last_raw or {"ok": False, "error": "xundan_chat_list failed for all queue keys"}
+                fallback = list_conversations_fallback(session, limit=size)
+                if fallback.get("ok") and fallback.get("items"):
+                    fallback["error"] = msg or "xundan whale_block:11001"
+                    fallback["xundan_error"] = msg or "whale_block:11001"
+                    return fallback
+                last_raw["ok"] = False
+                last_raw["api_code"] = 11001
+                last_raw["error"] = msg or "whale_block:11001"
+                last_raw["whale_v"] = (session.query_tokens or {}).get("whale_v")
+            elif not client.available():
+                last_raw["error"] = last_raw.get("error") or "relay unavailable (need curl_cffi + bdms sign)"
+
+        if not merged_items and not skip_warm:
+            try:
+                from pigeon_protocol.conv_list_fallback import list_conversations_fallback
+
+                fallback = list_conversations_fallback(session, limit=size)
+                if fallback.get("ok") and fallback.get("items"):
+                    if isinstance(last_raw, dict):
+                        fallback["xundan_empty"] = True
+                        fallback["xundan_via"] = last_raw.get("via")
+                    return fallback
+            except Exception as exc:
+                logger.debug("conv_list empty xundan fallback: %s", exc)
+
+        return last_raw or {"ok": False, "error": "xundan_chat_list failed for all queue keys"}
+    finally:
+        if light_token is not None:
+            _conv_light_ctx.reset(light_token)
 
 
 def _format_ts_ms(ms: Any) -> tuple[int, str]:

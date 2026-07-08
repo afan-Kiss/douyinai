@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -53,6 +54,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	headless := os.Getenv("PIGEON_HEADLESS") == "1" || os.Getenv("PIGEON_API_ONLY") == "1"
+
 	var wg sync.WaitGroup
 	if pyCmd != nil {
 		wg.Add(1)
@@ -60,6 +63,13 @@ func main() {
 			defer wg.Done()
 			_ = pyCmd.Wait()
 		}()
+	}
+
+	if headless {
+		fmt.Fprintf(os.Stderr, "[pigeon-feige] headless API on %s\n", apiURL)
+		waitExit(pyCmd)
+		wg.Wait()
+		return
 	}
 
 	useBrowser := os.Getenv("PIGEON_USE_BROWSER") == "1"
@@ -152,8 +162,9 @@ func waitExit(cmd *exec.Cmd) {
 
 func waitHealth(url string) bool {
 	client := &http.Client{Timeout: 2 * time.Second}
+	healthURL := strings.TrimSuffix(url, "/") + "/api/health"
 	for i := 0; i < 40; i++ {
-		resp, err := client.Get(url)
+		resp, err := client.Get(healthURL)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == 200 {

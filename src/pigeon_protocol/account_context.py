@@ -20,6 +20,20 @@ REGISTRY_FILE = ACCOUNTS_ROOT / "registry.json"
 LEGACY_SESSION_DIR = ROOT / "session"
 LEGACY_BUNDLE_DIR = ROOT / "standalone_bundle"
 
+_LOGOUT_BACKUP_FILES = (
+    "session.json",
+    "ws_inner_cache.json",
+    "ws_inner_portable.json",
+    "pigeon_session_pack.zip",
+    "bundle/ws_inner_canonical.json",
+    "bundle/bdms_browser_env.json",
+    "bundle/conv_sign_snapshot.json",
+    "bundle/order_sign_snapshot.json",
+    "logs/fxg_login_qr.png",
+)
+
+_LOGOUT_CLEAR_FILES = _LOGOUT_BACKUP_FILES
+
 _PACK_REL_FILES = (
     "session.json",
     "ws_inner_cache.json",
@@ -308,7 +322,11 @@ def promote_account_to_shop(account_id: str, shop_id: str) -> str:
         return src
     canonical = derive_account_id(shop_id=shop)
     if src == canonical:
-        register_account(canonical, label=f"店铺 {shop}", shop_id=shop, set_active=True)
+        from pigeon_protocol.shop_profile import cached_shop_name
+        from pigeon_protocol.session import load_session
+
+        name = cached_shop_name(load_session()) or shop
+        register_account(canonical, label=name, shop_id=shop, set_active=True)
         return canonical
     src_home = account_home(src)
     dest_home = ensure_account_dirs(canonical)
@@ -319,9 +337,13 @@ def promote_account_to_shop(account_id: str, shop_id: str) -> str:
         row for row in (doc.get("accounts") or []) if isinstance(row, dict) and str(row.get("id") or "") != src
     ]
     save_registry(doc)
-    register_account(canonical, label=f"店铺 {shop}", shop_id=shop, set_active=True)
+    from pigeon_protocol.shop_profile import cached_shop_name
+    from pigeon_protocol.session import load_session
+
+    name = cached_shop_name(load_session()) or shop
+    register_account(canonical, label=name, shop_id=shop, set_active=True)
     apply_account_env(canonical)
-    logger.info("promoted account %s -> %s (shop %s)", src, canonical, shop)
+    logger.info("promoted account %s -> %s (shop %s name=%s)", src, canonical, shop, name)
     return canonical
 
 
@@ -383,6 +405,8 @@ def consolidate_registry_duplicates() -> dict[str, Any]:
 
 
 def _build_account_row(row: dict[str, Any], *, active: str) -> dict[str, Any]:
+    from pigeon_protocol.shop_profile import display_shop_name, is_placeholder_shop_label, shop_name_from_mapping
+
     aid = str(row.get("id") or "")
     home = account_home(aid)
     sess = _read_json(home / "session.json") or {}
@@ -390,10 +414,16 @@ def _build_account_row(row: dict[str, Any], *, active: str) -> dict[str, Any]:
     logged_in = bool(cookies.get("sessionid") or cookies.get("sid_tt"))
     shop = str(row.get("shop_id") or cookies.get("SHOP_ID") or sess.get("shop_id") or "")
     label = str(row.get("label") or "")
-    if shop:
-        display = f"店铺 {shop}"
-    elif label and label not in (aid, "test", "新账号") and not label.startswith("acct_"):
+    logged_out_at = int(row.get("logged_out_at") or 0)
+    if logged_out_at:
+        logged_in = False
+    shop_name = shop_name_from_mapping(row, shop_id=shop) or shop_name_from_mapping(sess, shop_id=shop)
+    if shop_name:
+        display = shop_name
+    elif label and not is_placeholder_shop_label(label, shop):
         display = label
+    elif logged_in and shop:
+        display = display_shop_name(registry_row={"shop_id": shop, "label": label}, shop_id=shop)
     elif label == "新账号" or label == "test" or not label:
         display = "空账号槽"
     else:
@@ -402,9 +432,11 @@ def _build_account_row(row: dict[str, Any], *, active: str) -> dict[str, Any]:
         "id": aid,
         "label": display,
         "shop_id": shop,
+        "shop_name": shop_name or (display if logged_in and not is_placeholder_shop_label(display, shop) else ""),
         "active": aid == active,
         "logged_in": logged_in,
-        "is_empty_slot": not logged_in,
+        "logged_out_at": logged_out_at,
+        "is_empty_slot": not logged_in and not logged_out_at,
         "created_at": int(row.get("created_at") or 0),
         "updated_at": int(row.get("updated_at") or 0),
         "home": str(home),
@@ -421,6 +453,8 @@ def list_accounts(*, dedupe: bool = True) -> list[dict[str, Any]]:
             continue
         aid = str(row.get("id") or "")
         if not aid:
+            continue
+        if int(row.get("logged_out_at") or 0):
             continue
         out.append(_build_account_row(row, active=active))
     if dedupe:
@@ -466,7 +500,12 @@ def register_account_from_session(session, *, set_active: bool = False, source_a
     if shop and src and src != derive_account_id(shop_id=shop):
         return promote_account_to_shop(src, shop)
     aid = derive_account_id(shop_id=shop, sessionid=sid)
-    label = f"店铺 {shop}" if shop else aid
+    from pigeon_protocol.shop_profile import cached_shop_name, is_placeholder_shop_label
+
+    name = cached_shop_name(session)
+    label = name if name else (shop if shop else aid)
+    if shop and is_placeholder_shop_label(label, shop):
+        label = shop
     register_account(aid, label=label, shop_id=shop, set_active=set_active)
     return aid
 
@@ -535,7 +574,154 @@ def switch_account(account_id: str) -> dict[str, Any]:
     save_registry(doc)
     apply_account_env(aid)
     ensure_account_dirs(aid)
+    try:
+        from pigeon_protocol.conv_list_service import clear_conv_cache
+
+        clear_conv_cache()
+    except Exception as exc:
+        logger.debug("clear conv cache on switch: %s", exc)
     return {"ok": True, "account_id": aid, "home": str(account_home(aid))}
+
+
+def _backup_account_files(home: Path, tag: str) -> Path:
+    dest = home / "backups" / f"{tag}_{_now()}"
+    dest.mkdir(parents=True, exist_ok=True)
+    for rel in _LOGOUT_BACKUP_FILES:
+        src = home / rel
+        if not src.is_file():
+            continue
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+    return dest
+
+
+def _clear_account_auth_files(home: Path) -> None:
+    for rel in _LOGOUT_CLEAR_FILES:
+        path = home / rel
+        if path.is_file():
+            try:
+                path.unlink()
+            except OSError as exc:
+                logger.warning("clear %s: %s", path, exc)
+
+
+def _pick_next_account_after_removal(excluded: str) -> str:
+    for row in list_accounts(dedupe=False):
+        rid = str(row.get("id") or "")
+        if rid and rid != excluded and row.get("logged_in"):
+            return rid
+    empty = find_empty_account_slot()
+    if empty and empty != excluded:
+        return empty
+    return create_account_slot(label="新账号")
+
+
+def logout_account(account_id: str | None = None, *, backup: bool = True) -> dict[str, Any]:
+    """Clear auth for one account slot; keep registry row marked logged out."""
+    aid = str(account_id or active_account_id() or "").strip()
+    if not aid:
+        return {"ok": False, "error": "account_id required"}
+    if not _account_entry(load_registry(), aid):
+        return {"ok": False, "error": f"unknown account: {aid}"}
+
+    apply_account_env(aid)
+    home = ensure_account_dirs(aid)
+    backup_path = ""
+    if backup:
+        backup_path = str(_backup_account_files(home, "logout"))
+    _clear_account_auth_files(home)
+
+    doc = load_registry()
+    row = _account_entry(doc, aid)
+    if row:
+        prev_label = str(row.get("label") or "").strip()
+        shop = str(row.get("shop_id") or "").strip()
+        if prev_label and "已退出" not in prev_label:
+            display = prev_label
+        elif shop:
+            display = f"店铺 {shop}"
+        else:
+            display = "店铺"
+        row["logged_out_at"] = _now()
+        row["label"] = f"{display}（已退出）"
+        row["updated_at"] = _now()
+        save_registry(doc)
+
+    try:
+        from pigeon_protocol.conv_list_service import clear_conv_cache
+
+        clear_conv_cache(account_id=aid)
+    except Exception as exc:
+        logger.debug("clear conv cache on logout: %s", exc)
+
+    switched_to = ""
+    if active_account_id() == aid:
+        switched_to = _pick_next_account_after_removal(aid)
+        switch_account(switched_to)
+
+    return {
+        "ok": True,
+        "account_id": aid,
+        "switched_to": switched_to,
+        "backup_dir": backup_path,
+        "accounts": list_accounts(),
+    }
+
+
+def remove_account(account_id: str | None = None, *, backup: bool = True) -> dict[str, Any]:
+    """Remove account from registry; rename home dir instead of deleting."""
+    aid = str(account_id or active_account_id() or "").strip()
+    if not aid:
+        return {"ok": False, "error": "account_id required"}
+    doc = load_registry()
+    row = _account_entry(doc, aid)
+    if not row:
+        return {"ok": False, "error": f"unknown account: {aid}"}
+
+    apply_account_env(aid)
+    home = account_home(aid)
+    backup_path = ""
+    if backup and home.is_dir():
+        backup_path = str(_backup_account_files(home, "remove"))
+
+    doc["accounts"] = [
+        r for r in (doc.get("accounts") or []) if not (isinstance(r, dict) and str(r.get("id") or "") == aid)
+    ]
+    was_active = str(doc.get("active_account_id") or "") == aid
+    if was_active:
+        doc["active_account_id"] = ""
+    save_registry(doc)
+
+    if home.is_dir():
+        removed_name = f"_removed_{aid}_{_now()}"
+        dest = ACCOUNTS_ROOT / removed_name
+        try:
+            if dest.exists():
+                shutil.rmtree(dest, ignore_errors=True)
+            home.rename(dest)
+        except OSError as exc:
+            logger.warning("rename removed account dir %s -> %s: %s", home, dest, exc)
+
+    switched_to = ""
+    if was_active:
+        switched_to = _pick_next_account_after_removal(aid)
+        switch_account(switched_to)
+
+    try:
+        from pigeon_protocol.conv_list_service import clear_conv_cache
+
+        clear_conv_cache(account_id=aid)
+    except Exception as exc:
+        logger.debug("clear conv cache on remove: %s", exc)
+
+    return {
+        "ok": True,
+        "account_id": aid,
+        "switched_to": switched_to,
+        "backup_dir": backup_path,
+        "accounts": list_accounts(),
+    }
 
 
 def _copy_tree_files(src_dir: Path, dest_dir: Path, names: tuple[str, ...]) -> list[str]:

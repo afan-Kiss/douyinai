@@ -8,7 +8,8 @@ param(
     [int]$StressRounds = 10,
     [switch]$RunStress,
     [switch]$Json,
-    [int]$ApiTimeoutSec = 30,
+    [int]$ApiTimeoutSec = 12,
+    [int]$StressApiTimeoutSec = 10,
     [int]$MaxFeige = 1,
     [int]$MaxNode = 2,
     [int]$MaxPython = 3
@@ -16,6 +17,8 @@ param(
 
 $ErrorActionPreference = "Continue"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$Helpers = Join-Path $Root "scripts\lib\acceptance_helpers.ps1"
+if (Test-Path $Helpers) { . $Helpers }
 
 $ProjectPattern = 'douyin-pigeon-protocol|pigeon-feige|run\.py|go-bridge|pigeon_protocol|run_bdms_daemon\.mjs|run_bdms_fetch\.mjs'
 
@@ -171,7 +174,8 @@ function Invoke-ApiCheck {
     param(
         [string]$Path,
         [string]$Label,
-        [int]$Retries = 1
+        [int]$Retries = 1,
+        [int]$TimeoutSec = $ApiTimeoutSec
     )
     $url = ($BaseUrl.TrimEnd('/')) + $Path
     $attempt = 0
@@ -192,7 +196,7 @@ function Invoke-ApiCheck {
             attempts   = $attempt
         }
         try {
-            $raw = curl.exe -sS -m $ApiTimeoutSec -w "`n%{http_code}" $url 2>&1
+            $raw = curl.exe -sS -m $TimeoutSec -w "`n%{http_code}" $url 2>&1
             $lines = @($raw -split "`n")
             if ($lines.Count -lt 2) {
                 $item.error = "empty response"
@@ -370,6 +374,18 @@ function Invoke-StressSuite {
         [int]$Rounds,
         [hashtable]$Before
     )
+    if (Get-Command Assert-AcceptanceServiceReady -ErrorAction SilentlyContinue) {
+        if (-not (Assert-AcceptanceServiceReady -BaseUrl $BaseUrl)) {
+            return [ordered]@{
+                rounds  = $Rounds
+                cases   = @([ordered]@{ label = 'preflight'; severity = 'fail'; pass = $false; fail = 1; ok = 0; avg_ms = 0; p95_ms = 0; max_ms = 0; error = 'API not ready before stress' })
+                before  = $Before
+                after   = $Before
+                growth  = [ordered]@{ feige_delta = 0; python_delta = 0; node_delta = 0; pass = $false }
+                aborted = $true
+            }
+        }
+    }
     $cases = @(
         @{ label = 'session_light'; path = '/api/session?light=1' },
         @{ label = 'accounts'; path = '/api/accounts' },
@@ -378,17 +394,40 @@ function Invoke-StressSuite {
         @{ label = 'qr_status'; path = '/api/qr-login/status' }
     )
     $results = @()
+    $suiteAborted = $false
     foreach ($case in $cases) {
+        if ($suiteAborted) { break }
         $okCount = 0
         $failCount = 0
         $times = @()
         for ($i = 1; $i -le $Rounds; $i++) {
-            $hit = Invoke-ApiCheck -Path $case.path -Label $case.label
+            if (Get-Command Test-AcceptanceApiHealth -ErrorAction SilentlyContinue) {
+                if (-not (Test-AcceptanceApiHealth -BaseUrl $BaseUrl)) {
+                    $failCount += ($Rounds - $i + 1)
+                    $suiteAborted = $true
+                    break
+                }
+                $live = Get-AcceptanceProjectCounts
+                if ($live.feige -ne 1) {
+                    $failCount += ($Rounds - $i + 1)
+                    $suiteAborted = $true
+                    break
+                }
+            }
+            $hit = Invoke-ApiCheck -Path $case.path -Label $case.label -Retries 0 -TimeoutSec $StressApiTimeoutSec
             $times += [int]$hit.elapsed_ms
-            if ($hit.ok) { $okCount++ } else { $failCount++ }
+            if ($hit.ok) { $okCount++ } else {
+                $failCount++
+                if ($failCount -ge 3 -and (Get-Command Test-AcceptanceApiHealth -ErrorAction SilentlyContinue) -and -not (Test-AcceptanceApiHealth -BaseUrl $BaseUrl)) {
+                    $failCount += ($Rounds - $i)
+                    $suiteAborted = $true
+                    break
+                }
+            }
         }
+        if ($times.Count -eq 0) { $times = @(0) }
         $stats = Measure-LatencyStats -Samples $times
-        $severity = if ($failCount -gt 0) { 'fail' } else { Get-ApiLatencySeverity -Label $case.label -ElapsedMs $stats.max_ms -Ok $true }
+        $severity = if ($failCount -gt 0 -or $suiteAborted) { 'fail' } else { Get-ApiLatencySeverity -Label $case.label -ElapsedMs $stats.max_ms -Ok $true }
         $results += [ordered]@{
             label      = $case.label
             rounds     = $Rounds
@@ -399,7 +438,9 @@ function Invoke-StressSuite {
             max_ms     = $stats.max_ms
             severity   = $severity
             pass       = ($severity -ne 'fail')
+            aborted    = $suiteAborted
         }
+        if ($suiteAborted) { break }
     }
 
     Start-Sleep -Milliseconds 500
@@ -411,6 +452,7 @@ function Invoke-StressSuite {
         python_delta = $after.python_count - $Before.python_count
         node_delta   = $after.node_count - $Before.node_count
         pass         = (
+            ($after.feige_count -eq 1) -and
             ($after.feige_count - $Before.feige_count -le 0) -and
             ($after.python_count - $Before.python_count -le 0) -and
             ($after.node_count - $Before.node_count -le 0)
@@ -423,10 +465,16 @@ function Invoke-StressSuite {
         before  = $Before
         after   = $after
         growth  = $growth
+        aborted = $suiteAborted
     }
 }
 
 $startedAt = Get-Date
+if (Get-Command Assert-AcceptanceServiceReady -ErrorAction SilentlyContinue) {
+    if (-not (Assert-AcceptanceServiceReady -BaseUrl $BaseUrl)) {
+        exit 1
+    }
+}
 $rows = Get-ProjectWin32Processes
 $snapshot = Get-ProcessSnapshot -Rows $rows
 $limitChecks = Test-SnapshotLimits -Snap $snapshot -Phase 'baseline'
@@ -532,15 +580,22 @@ else {
     if ($stress) {
         Write-Host ''
         Write-Host "[Stress x$StressRounds]" -ForegroundColor Yellow
+        if ($stress.aborted) {
+            Write-Host '  [FAIL] stress aborted early (API or feige died)' -ForegroundColor Red
+        }
         foreach ($s in $stress.cases) {
             $mark = switch ($s.severity) { 'warn' { 'WARN' } 'fail' { 'FAIL' } default { 'PASS' } }
             $color = switch ($s.severity) { 'warn' { 'Yellow' } 'fail' { 'Red' } default { 'Green' } }
-            Write-Host ("  [{0}] {1}: ok={2} fail={3} avg={4}ms p95={5}ms max={6}ms" -f $mark, $s.label, $s.ok, $s.fail, $s.avg_ms, $s.p95_ms, $s.max_ms) -ForegroundColor $color
+            $abortNote = if ($s.aborted) { ' aborted' } else { '' }
+            Write-Host ("  [{0}] {1}: ok={2} fail={3} avg={4}ms p95={5}ms max={6}ms{7}" -f $mark, $s.label, $s.ok, $s.fail, $s.avg_ms, $s.p95_ms, $s.max_ms, $abortNote) -ForegroundColor $color
         }
         $g = $stress.growth
         $gmark = if ($g.pass) { 'PASS' } else { 'FAIL' }
         $gcolor = if ($g.pass) { 'Green' } else { 'Red' }
-        Write-Host ("  [{0}] growth feige+{1} python+{2} node+{3}" -f $gmark, $g.feige_delta, $g.python_delta, $g.node_delta) -ForegroundColor $gcolor
+        Write-Host ("  [{0}] growth feige+{1} python+{2} node+{3} (feige after={4})" -f $gmark, $g.feige_delta, $g.python_delta, $g.node_delta, $stress.after.feige_count) -ForegroundColor $gcolor
+        if (-not $g.pass -and (Get-Command Write-AcceptanceRecoveryDiagnostics -ErrorAction SilentlyContinue)) {
+            Write-AcceptanceRecoveryDiagnostics -Hint 'stress growth check failed'
+        }
     }
     Write-Host ''
     switch ($overallSeverity) {

@@ -187,6 +187,23 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
         label = str(params.get("label") or "新账号")
         return api.create_account_api(label=label)
 
+    if action == "account_logout":
+        from pigeon_protocol import api_server as api
+
+        aid = str(params.get("account_id") or "").strip()
+        backup = bool(params.get("backup", True))
+        result = api.logout_account_api(aid or None, backup=backup)
+        return result if result.get("ok") else _err(result.get("error") or "logout failed", **result)
+
+    if action == "account_remove":
+        from pigeon_protocol import api_server as api
+
+        aid = str(params.get("account_id") or "").strip()
+        backup = bool(params.get("backup", True))
+        confirm = bool(params.get("confirm"))
+        result = api.remove_account_api(aid or None, backup=backup, confirm=confirm)
+        return result if result.get("ok") else _err(result.get("error") or "remove failed", **result)
+
     if action == "prepare_pure":
         from pigeon_protocol.foundation.pure_prepare import prepare_pure_runtime
         from pigeon_protocol.session import load_session
@@ -239,13 +256,24 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
         acct = account_status()
         qr_snap = api.qr_active_snapshot()
         qr_active = bool(qr_snap.get("active"))
-        if qr_active:
-            logged_in = False
+        aid = str(acct.get("active_account_id") or "")
+        with api._qr_lock:
+            job = dict(api._qr_jobs.get(aid) or {})
+        if logged_in or (job.get("logged_in") and job.get("done")):
+            qr_active = False
+            logged_in = True
         snap = last_keepalive()
         ready = snap.get("readiness") if isinstance(snap.get("readiness"), dict) else {}
         shop = cookies.get("SHOP_ID") or session.shop_id or ""
+        from pigeon_protocol.shop_profile import ensure_shop_name
+
+        shop_name = ensure_shop_name(session, fetch=bool(logged_in))
         send_ready = ready.get("send_ready")
         listen_ready = ready.get("listen_ready")
+        if job.get("send_ready") is not None:
+            send_ready = job.get("send_ready")
+        if job.get("listen_ready") is not None:
+            listen_ready = job.get("listen_ready")
         if send_ready is None:
             send_ready = bool(session.query_tokens.get("pigeon_sign") and session.ws_urls)
         if listen_ready is None:
@@ -264,7 +292,7 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
                 "logged_in": logged_in,
                 "session_alive": bool(cookies.get("sessionid") or cookies.get("sid_tt")),
                 "shop_id": shop,
-                "shop_name": f"店铺 {shop}" if shop else "飞鸽客服",
+                "shop_name": shop_name,
                 "cookie_count": len(cookies),
                 "qr": {
                     "phase": qr_snap.get("phase") or ("logged_in" if logged_in else "logged_out"),
@@ -551,8 +579,17 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
 
     if action == "events":
         since = int(params.get("since") or 0)
+        filter_aid = str(params.get("account_id") or "").strip()
         with _event_lock:
-            items = [e for e in _event_queue if e["seq"] > since]
+            items = []
+            for e in _event_queue:
+                if e["seq"] <= since:
+                    continue
+                evt_aid = str(e.get("account_id") or "")
+                if filter_aid:
+                    if not evt_aid or evt_aid != filter_aid:
+                        continue
+                items.append(e)
             last = _event_seq
         return _ok({"items": items, "last_seq": last})
 

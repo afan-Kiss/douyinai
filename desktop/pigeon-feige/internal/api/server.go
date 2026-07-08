@@ -21,7 +21,7 @@ type Server struct {
 	Bridge  *bridge.Client
 	UIDir   string
 	mu      sync.Mutex
-	unread  map[string]int
+	unread  map[string]map[string]int
 }
 
 func NewServer(root string) *Server {
@@ -29,7 +29,7 @@ func NewServer(root string) *Server {
 		Root:   root,
 		Bridge: bridge.NewClient(root),
 		UIDir:  filepath.Join(root, "desktop", "ui"),
-		unread: map[string]int{},
+		unread: map[string]map[string]int{},
 	}
 }
 
@@ -42,6 +42,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/accounts", s.handleAccounts)
 	mux.HandleFunc("/api/accounts/switch", s.handleAccountsSwitch)
 	mux.HandleFunc("/api/accounts/create", s.handleAccountsCreate)
+	mux.HandleFunc("/api/accounts/logout", s.handleAccountsLogout)
+	mux.HandleFunc("/api/accounts/remove", s.handleAccountsRemove)
 	mux.HandleFunc("/api/conversations", s.handleConversations)
 	mux.HandleFunc("/api/context", s.handleContext)
 	mux.HandleFunc("/api/orders", s.handleOrders)
@@ -76,7 +78,35 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) StartBackgroundPrepare() {
+	if os.Getenv("PIGEON_ENABLE_STARTUP_WARM") != "1" {
+		return
+	}
 	go warmCSRF(s.Root)
+}
+
+func (s *Server) activeAccountID() string {
+	return protocol.ActiveAccountID(s.Root)
+}
+
+func (s *Server) bumpUnread(accountID, uid string) {
+	if accountID == "" || uid == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.unread[accountID] == nil {
+		s.unread[accountID] = map[string]int{}
+	}
+	s.unread[accountID][uid] = s.unread[accountID][uid] + 1
+}
+
+func (s *Server) clearUnreadAccount(accountID string) {
+	if accountID == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.unread, accountID)
+	s.mu.Unlock()
 }
 
 func (s *Server) Close() {
@@ -268,6 +298,7 @@ func (s *Server) handleAccountsSwitch(w http.ResponseWriter, r *http.Request) {
 	if v, ok := body["restart_listen"].(bool); ok {
 		restartListen = v
 	}
+	prevAID := protocol.ActiveAccountID(s.Root)
 	out, err := s.Bridge.Call("switch_account", map[string]any{
 		"account_id":      accountID,
 		"restart_listen":  restartListen,
@@ -276,6 +307,56 @@ func (s *Server) handleAccountsSwitch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
+	s.clearUnreadAccount(prevAID)
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) handleAccountsLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"ok": false})
+		return
+	}
+	body := readJSON(r)
+	prevAID := s.activeAccountID()
+	params := map[string]any{"backup": true}
+	if v, ok := body["account_id"].(string); ok && v != "" {
+		params["account_id"] = v
+	}
+	if v, ok := body["backup"].(bool); ok {
+		params["backup"] = v
+	}
+	out, err := s.Bridge.Call("account_logout", params)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	s.clearUnreadAccount(prevAID)
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) handleAccountsRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"ok": false})
+		return
+	}
+	body := readJSON(r)
+	prevAID := s.activeAccountID()
+	params := map[string]any{"backup": true, "confirm": false}
+	if v, ok := body["account_id"].(string); ok && v != "" {
+		params["account_id"] = v
+	}
+	if v, ok := body["backup"].(bool); ok {
+		params["backup"] = v
+	}
+	if v, ok := body["confirm"].(bool); ok {
+		params["confirm"] = v
+	}
+	out, err := s.Bridge.Call("account_remove", params)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	s.clearUnreadAccount(prevAID)
 	writeJSON(w, 200, out)
 }
 
@@ -328,16 +409,49 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
 		out, err = s.Bridge.Call("conv_list", params)
 	}
 	if err != nil {
+		if light {
+			writeJSON(w, 200, map[string]any{
+				"ok":           false,
+				"items":        []any{},
+				"count":        0,
+				"light":        true,
+				"needs_repair": true,
+				"error":        "session refresh unavailable",
+			})
+			return
+		}
 		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 	s.applyUnreadBumps(out)
-	writeJSON(w, 200, map[string]any{
+	resp := map[string]any{
 		"ok":    convListOK(out),
 		"items": out["items"],
 		"raw":   out["raw"],
 		"via":   "go/bridge",
-	})
+	}
+	if light {
+		resp["light"] = true
+		if v, ok := out["source"]; ok {
+			resp["source"] = v
+		}
+		if v, ok := out["warning"]; ok {
+			resp["warning"] = v
+		}
+		if v, ok := out["needs_repair"]; ok {
+			resp["needs_repair"] = v
+		}
+		if v, ok := out["error"]; ok {
+			resp["error"] = v
+		}
+		if v, ok := out["count"]; ok {
+			resp["count"] = v
+		}
+		if convListOK(out) {
+			resp["ok"] = true
+		}
+	}
+	writeJSON(w, 200, resp)
 }
 
 func convListOK(out map[string]any) bool {
@@ -361,10 +475,13 @@ func (s *Server) applyUnreadBumps(out map[string]any) {
 	if !ok {
 		return
 	}
+	aid := s.activeAccountID()
 	s.mu.Lock()
 	bumps := map[string]int{}
-	for k, v := range s.unread {
-		bumps[k] = v
+	if aid != "" && s.unread[aid] != nil {
+		for k, v := range s.unread[aid] {
+			bumps[k] = v
+		}
 	}
 	s.mu.Unlock()
 	for _, it := range arr {
@@ -396,7 +513,10 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	delete(s.unread, uid)
+	aid := s.activeAccountID()
+	if aid != "" && s.unread[aid] != nil {
+		delete(s.unread[aid], uid)
+	}
 	s.mu.Unlock()
 	ctx, _ := out["context"]
 	msgCount := 0
@@ -444,7 +564,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if v := r.URL.Query().Get("since"); v != "" {
 		since, _ = strconv.Atoi(v)
 	}
-	out, err := s.Bridge.Call("events", map[string]any{"since": since})
+	filterAID := strings.TrimSpace(r.URL.Query().Get("account_id"))
+	params := map[string]any{"since": since}
+	if filterAID != "" {
+		params["account_id"] = filterAID
+	}
+	out, err := s.Bridge.Call("events", params)
 	if err != nil {
 		writeJSON(w, 503, map[string]any{"ok": false, "error": err.Error(), "items": []any{}, "last_seq": since})
 		return
@@ -457,10 +582,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 			msg, _ := m["message"].(map[string]any)
 			uid, _ := msg["security_user_id"].(string)
-			if uid != "" {
-				s.mu.Lock()
-				s.unread[uid] = s.unread[uid] + 1
-				s.mu.Unlock()
+			evtAID, _ := m["account_id"].(string)
+			if uid != "" && evtAID != "" {
+				s.bumpUnread(evtAID, uid)
 			}
 		}
 	}
@@ -598,7 +722,10 @@ func (s *Server) handleConvAck(w http.ResponseWriter, r *http.Request) {
 	uid, _ := body["user_id"].(string)
 	if uid != "" {
 		s.mu.Lock()
-		delete(s.unread, uid)
+		aid := s.activeAccountID()
+		if aid != "" && s.unread[aid] != nil {
+			delete(s.unread[aid], uid)
+		}
 		s.mu.Unlock()
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "user_id": uid})

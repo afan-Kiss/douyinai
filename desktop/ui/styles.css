@@ -251,6 +251,8 @@ html.reduce-motion .pill .dot.pulse { animation: none !important; }
 }
 .btn.warn { background: var(--gold-soft); color: #7a5518; border-color: rgba(201, 146, 46, 0.25); }
 .btn.ghost { background: rgba(255, 255, 255, 0.6); border-color: var(--border); }
+.btn.ghost.warn { color: #b45309; border-color: rgba(180, 83, 9, 0.25); }
+.btn.ghost.warn:hover:not(:disabled) { background: #fff7ed; border-color: rgba(180, 83, 9, 0.35); color: #92400e; }
 .btn.ghost:hover:not(:disabled) { background: #fff; border-color: rgba(79, 99, 255, 0.25); color: var(--primary); }
 .btn.sm { padding: 5px 11px; font-size: 12px; }
 .btn.loading { position: relative; color: transparent !important; pointer-events: none; }

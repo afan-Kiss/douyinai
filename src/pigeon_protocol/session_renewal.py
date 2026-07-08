@@ -322,6 +322,12 @@ def session_alive(session) -> bool:
     return bool(c.get("sessionid") or c.get("sid_tt"))
 
 
+def _shop_display_name(session) -> str:
+    from pigeon_protocol.shop_profile import display_shop_name
+
+    return display_shop_name(session)
+
+
 def session_public_status(session) -> dict[str, Any]:
     """UI/API: 区分登录态 vs 飞鸽 backstage 就绪。"""
     from pigeon_protocol.session_readiness import assess_runtime_ready
@@ -340,7 +346,5 @@ def session_public_status(session) -> dict[str, Any]:
         "needs_full_login": not alive,
         "blockers": ready.get("blockers"),
         "shop_id": session.cookies.get("SHOP_ID") or session.shop_id,
-        "shop_name": f"店铺 {session.shop_id or session.cookies.get('SHOP_ID', '')}".strip()
-        if (session.shop_id or session.cookies.get("SHOP_ID"))
-        else "飞鸽客服",
+        "shop_name": _shop_display_name(session),
     }

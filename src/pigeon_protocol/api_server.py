@@ -34,7 +34,7 @@ _qr_jobs: dict[str, dict[str, Any]] = {}
 _qr_threads: dict[str, threading.Thread] = {}
 _qr_generation: dict[str, int] = {}
 _unread_lock = threading.Lock()
-_unread_bump: dict[str, int] = {}
+_unread_bump: dict[str, dict[str, int]] = {}
 
 
 def _ensure_accounts() -> None:
@@ -194,7 +194,8 @@ def _listen_worker() -> None:
                 uid = str(getattr(msg, "security_user_id", "") or "")
                 if uid:
                     with _unread_lock:
-                        _unread_bump[uid] = _unread_bump.get(uid, 0) + 1
+                        acct_bumps = _unread_bump.setdefault(bound_aid, {})
+                        acct_bumps[uid] = acct_bumps.get(uid, 0) + 1
                 _push_event("message", {"message": asdict(msg), "account_id": bound_aid})
 
             try:
@@ -233,8 +234,9 @@ def list_conversations(page: int = 0, size: int = 30) -> dict[str, Any]:
 
     result = fetch_conversations(page=page, size=size)
     items = result.get("items") or []
+    aid = _active_account_id()
     with _unread_lock:
-        bumps = dict(_unread_bump)
+        bumps = dict(_unread_bump.get(aid, {}))
     for it in items:
         uid = str(it.get("security_user_id") or "")
         if uid and bumps.get(uid):
@@ -259,6 +261,7 @@ def qr_active_snapshot() -> dict[str, Any]:
 def session_status() -> dict[str, Any]:
     from pigeon_protocol.account_context import account_status
     from pigeon_protocol.session import load_session
+    from pigeon_protocol.shop_profile import ensure_shop_name
 
     session = load_session()
     cookies = session.cookies or {}
@@ -287,7 +290,7 @@ def session_status() -> dict[str, Any]:
     return {
         "logged_in": logged_in,
         "shop_id": shop,
-        "shop_name": f"店铺 {shop}" if shop else "飞鸽客服",
+        "shop_name": ensure_shop_name(session, fetch=bool(logged_in)) if shop else "飞鸽客服",
         "cookie_count": len(cookies),
         "qr": qr,
         "active_account_id": acct.get("active_account_id") or aid,
@@ -435,16 +438,19 @@ def _qr_finish_confirmed(
         job["running"] = False
         job["error"] = ""
         job["done"] = True
+        job["listen_ready"] = True
 
     def _bootstrap() -> None:
         try:
             from pigeon_protocol.session_portable import post_login_bootstrap
 
+            bootstrap_mode = os.environ.get("PIGEON_POST_LOGIN_BOOTSTRAP", "background").strip().lower()
             pl = post_login_bootstrap(
                 session,
                 qr_client=client,
                 qr_state=st,
                 skip_fxg_complete=skip_fxg_complete,
+                mode=bootstrap_mode,
             )
             with _qr_lock:
                 job["post_login"] = {
@@ -887,7 +893,9 @@ def qr_login_status() -> dict[str, Any]:
         cookie_count = len(cookies)
         logged_in = bool(cookies.get("sessionid") or cookies.get("sid_tt"))
         shop = str(cookies.get("SHOP_ID") or session.shop_id or "")
-        shop_name = f"店铺 {shop}" if shop else "飞鸽客服"
+        from pigeon_protocol.shop_profile import ensure_shop_name
+
+        shop_name = ensure_shop_name(session, fetch=bool(logged_in))
     elif not qr_active:
         session = load_session()
         cookies = session.cookies or {}
@@ -934,7 +942,8 @@ def switch_active_account(account_id: str, *, restart_listen: bool = True) -> di
     if not result.get("ok"):
         return result
     with _unread_lock:
-        _unread_bump.clear()
+        if prev_aid:
+            _unread_bump.pop(prev_aid, None)
     if restart_listen:
         from pigeon_protocol.session import load_session
 
@@ -958,11 +967,61 @@ def list_accounts_api() -> dict[str, Any]:
 def create_account_api(*, label: str = "新账号") -> dict[str, Any]:
     from pigeon_protocol.account_context import create_account_slot, list_accounts
 
+    prev_aid = _active_account_id()
     aid = create_account_slot(label=label)
     stop_listen()
     with _unread_lock:
-        _unread_bump.clear()
+        if prev_aid:
+            _unread_bump.pop(prev_aid, None)
     return {"ok": True, "account_id": aid, "accounts": list_accounts()}
+
+
+def logout_account_api(account_id: str | None = None, *, backup: bool = True) -> dict[str, Any]:
+    from pigeon_protocol.account_context import account_logged_in, active_account_id, logout_account
+
+    aid = str(account_id or _active_account_id() or "").strip()
+    stop_listen()
+    if aid:
+        _qr_stop_event(aid).set()
+        with _qr_lock:
+            _qr_jobs.pop(aid, None)
+    with _unread_lock:
+        if aid:
+            _unread_bump.pop(aid, None)
+    result = logout_account(aid or None, backup=backup)
+    if not result.get("ok"):
+        return result
+    switched = str(result.get("switched_to") or active_account_id() or "")
+    return {
+        **result,
+        "active_account_id": active_account_id(),
+        "logged_in": account_logged_in(switched) if switched else False,
+    }
+
+
+def remove_account_api(account_id: str | None = None, *, backup: bool = True, confirm: bool = False) -> dict[str, Any]:
+    from pigeon_protocol.account_context import account_logged_in, active_account_id, remove_account
+
+    if not confirm:
+        return {"ok": False, "error": "confirm=true required"}
+    aid = str(account_id or _active_account_id() or "").strip()
+    stop_listen()
+    if aid:
+        _qr_stop_event(aid).set()
+        with _qr_lock:
+            _qr_jobs.pop(aid, None)
+    with _unread_lock:
+        if aid:
+            _unread_bump.pop(aid, None)
+    result = remove_account(aid or None, backup=backup)
+    if not result.get("ok"):
+        return result
+    switched = str(result.get("switched_to") or active_account_id() or "")
+    return {
+        **result,
+        "active_account_id": active_account_id(),
+        "logged_in": account_logged_in(switched) if switched else False,
+    }
 
 
 def ai_suggest(body: dict[str, Any]) -> dict[str, Any]:
@@ -1143,7 +1202,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 rt = _runtime()
                 ctx = rt.get_context(uid)
                 with _unread_lock:
-                    _unread_bump.pop(uid, None)
+                    aid = _active_account_id()
+                    acct_bumps = _unread_bump.get(aid)
+                    if acct_bumps is not None:
+                        acct_bumps.pop(uid, None)
                 self._send(
                     200,
                     {
@@ -1188,8 +1250,17 @@ class ApiHandler(BaseHTTPRequestHandler):
 
             if path == "/api/events":
                 since = int((qs.get("since") or ["0"])[0])
+                filter_aid = str((qs.get("account_id") or [""])[0]).strip()
                 with _event_lock:
-                    items = [e for e in _event_queue if e["seq"] > since]
+                    items = []
+                    for e in _event_queue:
+                        if e["seq"] <= since:
+                            continue
+                        evt_aid = str(e.get("account_id") or "")
+                        if filter_aid:
+                            if not evt_aid or evt_aid != filter_aid:
+                                continue
+                        items.append(e)
                     last = _event_seq
                 self._send(200, {"ok": True, "items": items, "last_seq": last})
                 return
@@ -1313,6 +1384,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(200, create_account_api(label=label))
                 return
 
+            if path == "/api/accounts/logout":
+                account_id = str(body.get("account_id") or "")
+                backup = body.get("backup", True)
+                self._send(200, logout_account_api(account_id or None, backup=bool(backup)))
+                return
+
+            if path == "/api/accounts/remove":
+                account_id = str(body.get("account_id") or "")
+                backup = body.get("backup", True)
+                confirm = bool(body.get("confirm"))
+                self._send(200, remove_account_api(account_id or None, backup=bool(backup), confirm=confirm))
+                return
+
             if path == "/api/ai/suggest":
                 self._send(200, ai_suggest(body))
                 return
@@ -1320,8 +1404,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path == "/api/conversations/ack":
                 uid = str(body.get("user_id") or "")
                 if uid:
+                    aid = _active_account_id()
                     with _unread_lock:
-                        _unread_bump.pop(uid, None)
+                        acct_bumps = _unread_bump.get(aid)
+                        if acct_bumps is not None:
+                            acct_bumps.pop(uid, None)
                 self._send(200, {"ok": True, "user_id": uid})
                 return
 

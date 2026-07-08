@@ -489,6 +489,61 @@ def _assess_runtime_ready_legacy(session) -> dict[str, Any]:
     }
 
 
+def _post_login_bootstrap_background(
+    session,
+    *,
+    qr_client: Any = None,
+    qr_state: Any = None,
+    skip_fxg_complete: bool = False,
+) -> dict[str, Any]:
+    """Light post-login warm: keepalive + header sync only (no CDP / prepare_pure)."""
+    from pigeon_protocol.session import save_session
+    from pigeon_protocol.session_readiness import assess_runtime_ready
+
+    report: dict[str, Any] = {"mode": "background", "steps": []}
+
+    if qr_state is not None and qr_client is not None:
+        try:
+            qr_client.apply_to_session(session, qr_state)
+            report["steps"].append("apply_session")
+        except Exception as exc:
+            report["apply_error"] = str(exc)[:200]
+
+    try:
+        from pigeon_protocol.session_keepalive import keepalive_tick
+
+        keepalive = keepalive_tick(save=True)
+        report["keepalive"] = keepalive
+        report["steps"].append("keepalive")
+    except Exception as exc:
+        report["keepalive_error"] = str(exc)[:200]
+
+    try:
+        from pigeon_protocol.session_health import auto_heal_session
+
+        health = auto_heal_session(session, refresh_csrf=True, refresh_sign=False)
+        report["session_health"] = health.to_dict()
+        if health.fixes_applied:
+            report["steps"].append("headers_sync")
+    except Exception as exc:
+        report["heal_error"] = str(exc)[:200]
+
+    ready = assess_runtime_ready(session, probe_backstage=False)
+    report["readiness"] = ready
+    report["send_ready"] = ready.get("send_ready")
+    report["listen_ready"] = True
+    report["conv_ready"] = ready.get("conv_ready")
+    report["blockers"] = list(ready.get("blockers") or [])
+    report["recommended_action"] = ready.get("recommended_action")
+    report["needs_cdp_onboard"] = ready.get("needs_cdp_onboard")
+    report["ok"] = True
+    try:
+        save_session(session)
+    except OSError as exc:
+        report["save_error"] = str(exc)[:120]
+    return report
+
+
 def post_login_bootstrap(
     session,
     *,
@@ -496,15 +551,40 @@ def post_login_bootstrap(
     qr_state: Any = None,
     export_pack: bool = True,
     skip_fxg_complete: bool = False,
+    mode: str | None = None,
 ) -> dict[str, Any]:
     """
-    QR 登录确认后的完整纯协议预热：
-    feige bootstrap → auto_heal → prepare-pure → rust_sdk 补 inner → 导出 sidecar/zip
+    QR 登录确认后的预热。mode=background（默认）仅轻量同步；full 走完整纯协议预热。
     """
+    import os
+
+    from pigeon_protocol.session_readiness import assess_runtime_ready
+
+    bootstrap_mode = (mode or os.environ.get("PIGEON_POST_LOGIN_BOOTSTRAP", "background")).strip().lower()
+    if bootstrap_mode == "off":
+        ready = assess_runtime_ready(session, probe_backstage=False)
+        return {
+            "ok": True,
+            "mode": "off",
+            "steps": [],
+            "send_ready": ready.get("send_ready"),
+            "listen_ready": True,
+            "conv_ready": ready.get("conv_ready"),
+            "blockers": list(ready.get("blockers") or []),
+            "readiness": ready,
+        }
+    if bootstrap_mode == "background":
+        return _post_login_bootstrap_background(
+            session,
+            qr_client=qr_client,
+            qr_state=qr_state,
+            skip_fxg_complete=skip_fxg_complete,
+        )
+
     from pigeon_protocol.qr_login import QR_CONFIRMED
     from pigeon_protocol.session import save_session
 
-    report: dict[str, Any] = {"steps": []}
+    report: dict[str, Any] = {"mode": "full", "steps": []}
 
     if qr_state is not None and qr_client is not None:
         if str(getattr(qr_state, "status", "") or "") == QR_CONFIRMED and not skip_fxg_complete:
