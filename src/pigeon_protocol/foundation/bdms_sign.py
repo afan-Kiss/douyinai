@@ -109,6 +109,15 @@ def _sign_node(
     timeout_sec: int,
 ) -> BdmsSignResult:
     from pigeon_protocol.foundation.bdms_node_daemon import sign_via_daemon
+    from pigeon_protocol.process_guard import (
+        NodeProcessLimitError,
+        cleanup_dead_registered_processes,
+        ensure_node_capacity,
+        oneshot_node_fallback_enabled,
+        register_child_process,
+        unregister_child_process,
+    )
+    from pigeon_protocol.subprocess_util import popen_hidden
 
     raw = sign_via_daemon(unsigned_url, body=body_str, method=method, timeout_sec=float(timeout_sec))
     if raw and raw.get("a_bogus"):
@@ -125,12 +134,94 @@ def _sign_node(
             error="" if ok else "missing a_bogus/msToken",
         )
 
+    if not oneshot_node_fallback_enabled():
+        return BdmsSignResult(
+            ok=False,
+            signed_url=unsigned_url,
+            error="Node 签名未就绪（daemon 不可用，one-shot fallback 已禁用）",
+            method=method.upper(),
+            via="node_bdms_daemon/unavailable",
+        )
+
+    if not ensure_node_capacity():
+        cleanup_dead_registered_processes()
+        if not ensure_node_capacity():
+            return BdmsSignResult(
+                ok=False,
+                signed_url=unsigned_url,
+                error="node process limit reached",
+                method=method.upper(),
+            )
+
+    cmd = ["node", str(FETCH_SCRIPT), unsigned_url, body_str, method.upper()]
+    proc = None
+    stdout = ""
+    stderr = ""
+    try:
+        proc = popen_hidden(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(ROOT),
+        )
+        if proc.pid:
+            register_child_process("node", int(proc.pid), cmd)
+        stdout, stderr = proc.communicate(timeout=timeout_sec)
+    except NodeProcessLimitError:
+        return BdmsSignResult(
+            ok=False,
+            signed_url=unsigned_url,
+            error="node process limit reached",
+            method=method.upper(),
+        )
+    except subprocess.TimeoutExpired:
+        if proc:
+            try:
+                proc.kill()
+                proc.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            if proc.pid:
+                unregister_child_process(int(proc.pid))
+        cleanup_dead_registered_processes()
+        return BdmsSignResult(
+            ok=False,
+            signed_url=unsigned_url,
+            error="node one-shot fallback timeout",
+            method=method.upper(),
+        )
+    finally:
+        cleanup_dead_registered_processes()
+
+    if not (stdout or "").strip():
+        return BdmsSignResult(
+            ok=False,
+            signed_url=unsigned_url,
+            error=(stderr or stdout or "empty node output")[:400],
+            method=method.upper(),
+        )
+    try:
+        raw = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        return BdmsSignResult(
+            ok=False,
+            signed_url=unsigned_url,
+            error=f"invalid json: {exc}",
+            method=method.upper(),
+        )
+
+    signed_url = best_signed_url(raw, fallback=unsigned_url)
+    tokens = extract_tokens(raw, fallback=signed_url)
+    ok = bool(tokens.get("a_bogus") and tokens.get("msToken"))
     return BdmsSignResult(
-        ok=False,
-        signed_url=unsigned_url,
-        error="Node 签名未就绪（daemon 不可用，已禁止 one-shot fallback）",
+        ok=ok or bool(raw.get("partial")),
+        signed_url=signed_url,
+        tokens=tokens,
+        via="node_bdms_oneshot",
         method=method.upper(),
-        via="node_bdms_daemon/unavailable",
+        raw=raw,
+        error="" if ok else "missing a_bogus/msToken",
     )
 
 

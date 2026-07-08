@@ -27,6 +27,8 @@ type Client struct {
 	daemonOut *bufio.Reader
 	daemonErr io.ReadCloser
 	daemonOK  bool
+
+	lastDaemonRestart time.Time
 }
 
 func NewClient(root string) *Client {
@@ -69,6 +71,8 @@ func (c *Client) bridgeEnv() []string {
 		"PIGEON_PURE_ONLY="+envOr("PIGEON_PURE_ONLY", "1"),
 		"PIGEON_NO_CDP="+envOr("PIGEON_NO_CDP", "1"),
 		"PIGEON_WS_HOST="+envOr("PIGEON_WS_HOST", "jinritemai"),
+		"PIGEON_NODE_MAX_PROCS="+envOr("PIGEON_NODE_MAX_PROCS", "2"),
+		"PIGEON_NODE_ONESHOT_FALLBACK="+envOr("PIGEON_NODE_ONESHOT_FALLBACK", "0"),
 	)
 	if c.Python != "" {
 		env = append(env, "PIGEON_PYTHON="+c.Python)
@@ -94,9 +98,22 @@ func (c *Client) resetDaemon() {
 }
 
 func (c *Client) CleanupNodes(reason string) {
+	c.CleanupNodesWithOptions(reason, false, 6*3600)
+}
+
+func (c *Client) CleanupNodesAll(reason string) {
+	c.CleanupNodesWithOptions(reason, true, 0)
+}
+
+func (c *Client) CleanupNodesWithOptions(reason string, killAll bool, olderThanSec int) {
+	params := map[string]any{"reason": reason, "kill_all": killAll}
+	if !killAll && olderThanSec > 0 {
+		params["kill_all"] = false
+		params["older_than_sec"] = olderThanSec
+	}
 	body, err := json.Marshal(map[string]any{
 		"action": "process_guard_cleanup",
-		"params": map[string]any{"kill_all": true, "reason": reason},
+		"params": params,
 	})
 	if err != nil {
 		return
@@ -233,7 +250,7 @@ func (c *Client) callOneShot(body []byte) (map[string]any, error) {
 
 func (c *Client) callTimeout(action string) time.Duration {
 	switch action {
-	case "ping", "session_status", "qr_login_status", "list_accounts", "listen_status", "health":
+	case "ping", "session_status", "qr_login_status", "list_accounts", "listen_status", "health", "process_status":
 		return 3 * time.Second
 	case "qr_login_start":
 		return 8 * time.Second
@@ -252,6 +269,13 @@ func (c *Client) ensureDaemon() bool {
 	}
 	c.daemonOK = c.startDaemon()
 	return c.daemonOK
+}
+
+func (c *Client) canRestartDaemon() bool {
+	if c.lastDaemonRestart.IsZero() {
+		return true
+	}
+	return time.Since(c.lastDaemonRestart) >= 30*time.Second
 }
 
 func (c *Client) Call(action string, params map[string]any) (map[string]any, error) {
@@ -274,15 +298,18 @@ func (c *Client) Call(action string, params map[string]any) (map[string]any, err
 		c.rpcMu.Unlock()
 		if err != nil {
 			c.mu.Lock()
-			if c.requireDaemon(action) {
+			if c.requireDaemon(action) && c.canRestartDaemon() {
 				c.CleanupNodes("daemon_timeout")
 				c.resetDaemon()
+				c.lastDaemonRestart = time.Now()
 				c.daemonOK = c.startDaemon()
 				if c.daemonOK {
 					c.rpcMu.Lock()
 					out, err = c.callDaemonWithTimeout(string(body), timeout)
 					c.rpcMu.Unlock()
 				}
+			} else if c.requireDaemon(action) {
+				err = fmt.Errorf("bridge daemon restarting, please retry")
 			}
 			c.mu.Unlock()
 			if err != nil && !c.requireDaemon(action) {
@@ -348,7 +375,7 @@ func (c *Client) Ping() error {
 func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.CleanupNodes("bridge_close")
+	c.CleanupNodesAll("bridge_close")
 	c.resetDaemon()
 }
 
@@ -360,5 +387,21 @@ func envOr(k, def string) string {
 }
 
 func (c *Client) PrepareAsync(timeout time.Duration) {
-	_ = timeout
+	if os.Getenv("PIGEON_ENABLE_BACKGROUND_PREPARE") != "1" {
+		return
+	}
+	root := c.Root
+	py := c.Python
+	go func() {
+		bg := &Client{Root: root, Python: py, daemonOK: false}
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if err := bg.Ping(); err == nil {
+				_, _ = bg.Call("warm_conv", nil)
+				_ = bg.PreparePure()
+				return
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+	}()
 }

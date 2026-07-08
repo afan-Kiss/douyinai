@@ -1,4 +1,4 @@
-"""Persistent Node bdms daemon — amortize jsdom+bdms.init cost."""
+"""Persistent Node bdms daemon — project-wide singleton (max 1)."""
 from __future__ import annotations
 
 import json
@@ -15,16 +15,28 @@ logger = logging.getLogger("pigeon.bdms_daemon")
 
 ROOT = Path(__file__).resolve().parents[3]
 DAEMON_SCRIPT = ROOT / "scripts" / "run_bdms_daemon.mjs"
+START_FAIL_COOLDOWN_SEC = 10.0
 
 _lock = threading.Lock()
 _proc: subprocess.Popen | None = None
 _seq = 0
 _ready = False
-_node_pid = 0
+_last_start_failed_at = 0.0
+
+
+def _mark_start_failed() -> None:
+    global _last_start_failed_at
+    _last_start_failed_at = time.time()
+
+
+def _in_start_cooldown() -> bool:
+    return (time.time() - _last_start_failed_at) < START_FAIL_COOLDOWN_SEC
 
 
 def _kill_proc() -> None:
-    global _proc, _ready, _node_pid
+    global _proc, _ready
+    from pigeon_protocol.process_guard import cleanup_dead_registered_processes, unregister_child_process
+
     pid = 0
     if _proc and _proc.poll() is None:
         pid = int(_proc.pid or 0)
@@ -32,16 +44,15 @@ def _kill_proc() -> None:
             _proc.kill()
         except OSError:
             pass
-    if pid:
         try:
-            from pigeon_protocol.process_guard import unregister_node_pid
-
-            unregister_node_pid(pid)
-        except Exception:
+            _proc.wait(timeout=3)
+        except (subprocess.TimeoutExpired, OSError):
             pass
+    if pid:
+        unregister_child_process(pid)
     _proc = None
     _ready = False
-    _node_pid = 0
+    cleanup_dead_registered_processes()
 
 
 def _reset() -> None:
@@ -55,31 +66,36 @@ def _reset() -> None:
 
 
 def _ensure_daemon() -> bool:
-    global _proc, _ready, _node_pid
+    global _proc, _ready
     if not DAEMON_SCRIPT.is_file():
         return False
     if _proc and _proc.poll() is None and _ready:
         return True
+    if _in_start_cooldown():
+        logger.debug("bdms daemon start skipped (cooldown)")
+        return False
 
     from pigeon_protocol.process_guard import (
         NodeProcessLimitError,
         acquire_bdms_daemon_lock,
-        prepare_node_spawn,
-        write_bdms_daemon_state,
+        ensure_node_capacity,
+        register_child_process,
     )
 
-    allowed, reason = prepare_node_spawn(kind="bdms_daemon")
-    if not allowed:
-        logger.info("bdms daemon blocked: %s", reason)
+    if not ensure_node_capacity():
+        logger.warning("node process limit reached, skip bdms daemon start")
+        _mark_start_failed()
         return False
     if not acquire_bdms_daemon_lock():
         logger.info("bdms daemon lock held by another process")
+        _mark_start_failed()
         return False
 
     _kill_proc()
+    cmd = ["node", str(DAEMON_SCRIPT)]
     try:
         _proc = popen_hidden(
-            ["node", str(DAEMON_SCRIPT)],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -88,21 +104,22 @@ def _ensure_daemon() -> bool:
             cwd=str(ROOT),
         )
     except NodeProcessLimitError as exc:
-        logger.info("bdms daemon spawn blocked: %s", exc)
+        logger.warning("bdms daemon spawn blocked: %s", exc)
         from pigeon_protocol.process_guard import release_bdms_daemon_lock
 
         release_bdms_daemon_lock()
+        _mark_start_failed()
         return False
     except OSError as exc:
         logger.debug("bdms daemon start failed: %s", exc)
         from pigeon_protocol.process_guard import release_bdms_daemon_lock
 
         release_bdms_daemon_lock()
+        _mark_start_failed()
         return False
 
-    _node_pid = int(_proc.pid or 0)
-    if _node_pid:
-        write_bdms_daemon_state(node_pid=_node_pid)
+    if _proc and _proc.pid:
+        register_child_process("node", int(_proc.pid), cmd)
 
     def _drain_stderr() -> None:
         if not _proc or not _proc.stderr:
@@ -118,10 +135,11 @@ def _ensure_daemon() -> bool:
     while time.time() < deadline:
         if _ready:
             return True
-        if _proc.poll() is not None:
+        if _proc and _proc.poll() is not None:
             break
         time.sleep(0.05)
     _reset()
+    _mark_start_failed()
     return False
 
 
@@ -137,12 +155,14 @@ def sign_via_daemon(unsigned_url: str, *, body: str = "", method: str = "GET", t
             _proc.stdin.flush()
         except OSError:
             _reset()
+            _mark_start_failed()
             return None
 
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             if _proc.poll() is not None:
                 _reset()
+                _mark_start_failed()
                 return None
             line = _proc.stdout.readline()
             if not line.strip():
@@ -153,9 +173,16 @@ def sign_via_daemon(unsigned_url: str, *, body: str = "", method: str = "GET", t
                 continue
             if resp.get("id") == req_id:
                 return resp
+        _mark_start_failed()
     return None
 
 
 def close_daemon() -> None:
     with _lock:
         _reset()
+        try:
+            from pigeon_protocol.process_guard import cleanup_dead_registered_processes
+
+            cleanup_dead_registered_processes()
+        except Exception:
+            pass

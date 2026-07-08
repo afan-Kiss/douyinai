@@ -66,6 +66,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/ai/suggest", s.handleAISuggest)
 	mux.HandleFunc("/api/protocol/status", s.handleProtocolStatus)
 	mux.HandleFunc("/api/protocol/prepare", s.handleProtocolPrepare)
+	mux.HandleFunc("/api/process/status", s.handleProcessStatus)
+	mux.HandleFunc("/api/process/cleanup", s.handleProcessCleanup)
 	mux.HandleFunc("/api/import-har", s.handleImportHar)
 	mux.HandleFunc("/api/import-cookies", s.handleImportCookies)
 	mux.HandleFunc("/api/session-pack/export", s.handleSessionPackExport)
@@ -730,6 +732,41 @@ func (s *Server) handleProtocolPrepare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := s.Bridge.Call("prepare_pure", map[string]any{"probe_ws": false})
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) handleProcessStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]any{"ok": false})
+		return
+	}
+	out, err := s.Bridge.Call("process_status", nil)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) handleProcessCleanup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"ok": false})
+		return
+	}
+	body := readJSON(r)
+	killAll := true
+	if v, ok := body["kill_all"].(bool); ok {
+		killAll = v
+	}
+	params := map[string]any{"kill_all": killAll}
+	if v, ok := body["older_than_sec"].(float64); ok && v > 0 {
+		params["older_than_sec"] = int(v)
+	}
+	out, err := s.Bridge.Call("process_cleanup", params)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
 		return

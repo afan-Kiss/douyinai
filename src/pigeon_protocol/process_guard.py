@@ -1,4 +1,4 @@
-"""Global guard for project-owned node.exe — limit spawns and cleanup orphans."""
+"""Global guard for project-owned node.exe — registry, limits, cleanup."""
 from __future__ import annotations
 
 import atexit
@@ -14,22 +14,15 @@ from pigeon_protocol.config import ROOT
 
 logger = logging.getLogger("pigeon.process_guard")
 
-MAX_NODE_PROCESSES = max(1, int(os.getenv("PIGEON_MAX_NODE", "1") or "1"))
-GUARD_DIR = ROOT / "logs" / "runtime"
-PID_FILE = GUARD_DIR / "node_pids.json"
-DAEMON_STATE_FILE = GUARD_DIR / "bdms_daemon.json"
-DAEMON_LOCK_FILE = GUARD_DIR / "bdms_daemon.lock"
+PID_FILE_NAME = "node_pids.json"
+DAEMON_LOCK_FILE_NAME = "bdms_daemon.lock"
 
-PROJECT_MARKERS = (
+PROJECT_CMD_MARKERS = (
+    "douyin-pigeon-protocol",
     "run_bdms_daemon.mjs",
     "run_bdms_fetch.mjs",
-    "run_bdms_node.mjs",
-    "run_bdms_env.mjs",
-    "run_frontier_glue.mjs",
-    "run_frontier_sign.mjs",
-    "douyin-pigeon-protocol",
-    "pigeon-feige",
     "pigeon_protocol",
+    "pigeon-feige",
 )
 
 _local_registered: set[int] = set()
@@ -40,26 +33,67 @@ class NodeProcessLimitError(RuntimeError):
     """Raised when spawning another node.exe would exceed the global limit."""
 
 
-def _ensure_guard_dir() -> None:
-    GUARD_DIR.mkdir(parents=True, exist_ok=True)
+def runtime_dir() -> Path:
+    path = ROOT / "logs" / "runtime"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-def _read_pid_registry() -> dict[str, Any]:
-    _ensure_guard_dir()
-    if not PID_FILE.is_file():
-        return {"pids": {}, "updated_at": 0}
+def _pid_file() -> Path:
+    return runtime_dir() / PID_FILE_NAME
+
+
+def _daemon_lock_file() -> Path:
+    return runtime_dir() / DAEMON_LOCK_FILE_NAME
+
+
+def node_process_limit() -> int:
+    raw = os.getenv("PIGEON_NODE_MAX_PROCS", "2").strip()
     try:
-        doc = json.loads(PID_FILE.read_text(encoding="utf-8"))
+        return max(1, int(raw))
+    except ValueError:
+        return 2
+
+
+def oneshot_node_fallback_enabled() -> bool:
+    return os.getenv("PIGEON_NODE_ONESHOT_FALLBACK", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _read_registry() -> dict[str, Any]:
+    path = _pid_file()
+    if not path.is_file():
+        return {"processes": [], "updated_at": 0}
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"pids": {}, "updated_at": 0}
-    doc.setdefault("pids", {})
-    return doc
+        return {"processes": [], "updated_at": 0}
+    if isinstance(doc.get("processes"), list):
+        return doc
+    # migrate legacy {"pids": {...}}
+    processes: list[dict[str, Any]] = []
+    for pid, meta in (doc.get("pids") or {}).items():
+        if isinstance(meta, dict):
+            processes.append(
+                {
+                    "pid": int(pid),
+                    "kind": meta.get("kind") or "node",
+                    "cmdline": meta.get("cmdline") or "",
+                    "created_at": int(meta.get("started_at") or meta.get("created_at") or 0),
+                    "owner_pid": int(meta.get("owner") or 0),
+                }
+            )
+    return {"processes": processes, "updated_at": int(doc.get("updated_at") or 0)}
 
 
-def _write_pid_registry(doc: dict[str, Any]) -> None:
-    _ensure_guard_dir()
+def _write_registry(doc: dict[str, Any]) -> None:
     doc["updated_at"] = int(time.time())
-    PID_FILE.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+    _pid_file().write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _cmdline_text(cmdline: list[str] | str) -> str:
+    if isinstance(cmdline, list):
+        return " ".join(str(x) for x in cmdline)
+    return str(cmdline or "")
 
 
 def _pid_alive(pid: int) -> bool:
@@ -74,8 +108,8 @@ def _pid_alive(pid: int) -> bool:
                 timeout=5,
                 check=False,
             )
-            text = (out.stdout or "") + (out.stderr or "")
-            return str(pid) in text and "node.exe" in text.lower()
+            text = ((out.stdout or "") + (out.stderr or "")).lower()
+            return str(pid) in text and "node.exe" in text
         except (OSError, subprocess.TimeoutExpired):
             return False
     try:
@@ -85,92 +119,71 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _prune_registry(doc: dict[str, Any]) -> dict[str, Any]:
-    pids = doc.get("pids") or {}
-    alive: dict[str, Any] = {}
-    for key, meta in pids.items():
-        try:
-            pid = int(key)
-        except (TypeError, ValueError):
-            continue
-        if _pid_alive(pid):
-            alive[str(pid)] = meta
-    doc["pids"] = alive
-    return doc
-
-
-def register_node_pid(pid: int, *, kind: str = "node", owner: str = "") -> None:
+def register_child_process(kind: str, pid: int, cmdline: list[str] | str) -> None:
     if pid <= 0:
         return
-    doc = _prune_registry(_read_pid_registry())
-    doc["pids"][str(pid)] = {
-        "kind": kind,
-        "owner": owner or str(os.getpid()),
-        "started_at": int(time.time()),
-    }
-    _write_pid_registry(doc)
-    _local_registered.add(pid)
-
-
-def unregister_node_pid(pid: int) -> None:
-    if pid <= 0:
-        return
-    doc = _read_pid_registry()
-    doc.get("pids", {}).pop(str(pid), None)
-    _write_pid_registry(doc)
-    _local_registered.discard(pid)
-
-
-def alive_project_node_count() -> int:
-    doc = _prune_registry(_read_pid_registry())
-    _write_pid_registry(doc)
-    return len(doc.get("pids") or {})
-
-
-def _command_line_is_project(cmdline: str) -> bool:
-    text = str(cmdline or "")
-    if not text:
-        return False
-    low = text.lower()
-    root = str(ROOT).lower()
-    if root and root in low:
-        return True
-    return any(marker.lower() in low for marker in PROJECT_MARKERS)
-
-
-def _list_windows_node_processes() -> list[dict[str, Any]]:
-    if os.name != "nt":
-        return []
-    ps = (
-        "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
-        "Select-Object ProcessId, CommandLine | ConvertTo-Json -Compress"
+    cleanup_dead_registered_processes()
+    doc = _read_registry()
+    processes = [p for p in doc.get("processes") or [] if int(p.get("pid") or 0) != pid]
+    processes.append(
+        {
+            "pid": int(pid),
+            "kind": str(kind or "node"),
+            "cmdline": _cmdline_text(cmdline),
+            "created_at": int(time.time()),
+            "owner_pid": os.getpid(),
+        }
     )
-    try:
-        out = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-            capture_output=True,
-            text=True,
-            timeout=12,
-            check=False,
+    doc["processes"] = processes
+    _write_registry(doc)
+    _local_registered.add(int(pid))
+
+
+def unregister_child_process(pid: int) -> None:
+    if pid <= 0:
+        return
+    doc = _read_registry()
+    doc["processes"] = [p for p in doc.get("processes") or [] if int(p.get("pid") or 0) != pid]
+    _write_registry(doc)
+    _local_registered.discard(int(pid))
+
+
+def list_registered_processes(kind: str = "node") -> list[dict[str, Any]]:
+    cleanup_dead_registered_processes()
+    out: list[dict[str, Any]] = []
+    for row in _read_registry().get("processes") or []:
+        if not isinstance(row, dict):
+            continue
+        row_kind = str(row.get("kind") or "node")
+        if kind and row_kind != kind:
+            continue
+        pid = int(row.get("pid") or 0)
+        alive = _pid_alive(pid)
+        out.append(
+            {
+                "pid": pid,
+                "kind": row_kind,
+                "cmdline": str(row.get("cmdline") or ""),
+                "alive": alive,
+                "created_at": int(row.get("created_at") or 0),
+                "owner_pid": int(row.get("owner_pid") or 0),
+            }
         )
-        raw = (out.stdout or "").strip()
-        if not raw:
-            return []
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            data = [data]
-        rows: list[dict[str, Any]] = []
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-            pid = int(row.get("ProcessId") or 0)
-            cmd = str(row.get("CommandLine") or "")
-            if pid > 0:
-                rows.append({"pid": pid, "cmdline": cmd})
-        return rows
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError) as exc:
-        logger.debug("list node processes: %s", exc)
-        return []
+    return out
+
+
+def cleanup_dead_registered_processes() -> None:
+    doc = _read_registry()
+    alive_rows: list[dict[str, Any]] = []
+    for row in doc.get("processes") or []:
+        if not isinstance(row, dict):
+            continue
+        pid = int(row.get("pid") or 0)
+        if pid > 0 and _pid_alive(pid):
+            alive_rows.append(row)
+    if len(alive_rows) != len(doc.get("processes") or []):
+        doc["processes"] = alive_rows
+        _write_registry(doc)
 
 
 def _kill_pid(pid: int) -> bool:
@@ -191,69 +204,83 @@ def _kill_pid(pid: int) -> bool:
         return False
 
 
-def cleanup_project_nodes(*, kill_all: bool = True, reason: str = "") -> dict[str, Any]:
-    """Kill tracked and orphan project node.exe processes."""
-    _ensure_guard_dir()
-    report: dict[str, Any] = {"killed": [], "reason": reason, "alive_before": alive_project_node_count()}
-    keep: set[int] = set()
+def kill_registered_processes(kind: str = "node", older_than_sec: int | None = None) -> int:
+    """Kill registered PIDs only — never scans arbitrary node.exe."""
+    cleanup_dead_registered_processes()
+    now = int(time.time())
+    killed = 0
+    doc = _read_registry()
+    keep: list[dict[str, Any]] = []
+    for row in doc.get("processes") or []:
+        if not isinstance(row, dict):
+            continue
+        row_kind = str(row.get("kind") or "node")
+        if kind and row_kind != kind:
+            keep.append(row)
+            continue
+        pid = int(row.get("pid") or 0)
+        created = int(row.get("created_at") or 0)
+        age = now - created if created else 0
+        if older_than_sec is not None and age < int(older_than_sec):
+            keep.append(row)
+            continue
+        if pid > 0 and _pid_alive(pid):
+            if _kill_pid(pid):
+                killed += 1
+        _local_registered.discard(pid)
+    doc["processes"] = keep
+    _write_registry(doc)
+    if killed:
+        logger.info("kill_registered_processes kind=%s killed=%d", kind, killed)
+    return killed
 
+
+def count_live_registered_processes(kind: str = "node") -> int:
+    return sum(1 for row in list_registered_processes(kind=kind) if row.get("alive"))
+
+
+def ensure_node_capacity() -> bool:
+    cleanup_dead_registered_processes()
+    live = count_live_registered_processes(kind="node")
+    return live < node_process_limit()
+
+
+def process_status() -> dict[str, Any]:
+    items = list_registered_processes(kind="node")
+    live = sum(1 for x in items if x.get("alive"))
+    return {
+        "ok": True,
+        "node": {
+            "max": node_process_limit(),
+            "registered_live": live,
+            "registered_total": len(items),
+            "oneshot_fallback": oneshot_node_fallback_enabled(),
+            "items": items,
+        },
+    }
+
+
+def process_cleanup(*, kill_all: bool = False, older_than_sec: int | None = None) -> dict[str, Any]:
+    cleanup_dead_registered_processes()
     if kill_all:
-        for row in _list_windows_node_processes():
-            pid = int(row.get("pid") or 0)
-            cmd = str(row.get("cmdline") or "")
-            if pid <= 0 or pid in keep:
-                continue
-            if _command_line_is_project(cmd):
-                if _kill_pid(pid):
-                    report["killed"].append(pid)
-                unregister_node_pid(pid)
-
-    doc = {"pids": {}, "updated_at": int(time.time())}
-    _write_pid_registry(doc)
-
-    stale_lock = DAEMON_LOCK_FILE
-    if stale_lock.exists() and kill_all:
-        try:
-            stale_lock.unlink(missing_ok=True)
-        except OSError:
-            pass
-    if DAEMON_STATE_FILE.exists() and kill_all:
-        try:
-            DAEMON_STATE_FILE.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    global _daemon_lock_handle
-    if _daemon_lock_handle is not None:
-        try:
-            _daemon_lock_handle.close()
-        except OSError:
-            pass
-        _daemon_lock_handle = None
-
-    report["alive_after"] = alive_project_node_count()
-    if report["killed"]:
-        logger.info("node cleanup killed %s (%s)", report["killed"], reason or "cleanup")
-    return report
+        killed = kill_registered_processes(kind="node", older_than_sec=None)
+    elif older_than_sec is not None:
+        killed = kill_registered_processes(kind="node", older_than_sec=int(older_than_sec))
+    else:
+        killed = 0
+    return {"ok": True, "killed": killed}
 
 
-def prepare_node_spawn(*, kind: str = "node") -> tuple[bool, str]:
-    """Return (allowed, reason). Refuses when global node limit reached."""
-    _prune_registry(_read_pid_registry())
-    alive = alive_project_node_count()
-    if alive >= MAX_NODE_PROCESSES:
-        return False, f"node limit reached ({alive}/{MAX_NODE_PROCESSES})"
-    return True, ""
+# --- bdms daemon cross-process lock ---
 
 
 def acquire_bdms_daemon_lock() -> bool:
-    """Cross-process lock — only one Python process may own the bdms node daemon."""
     global _daemon_lock_handle
     if _daemon_lock_handle is not None:
         return True
-    _ensure_guard_dir()
+    path = _daemon_lock_file()
     try:
-        fh = open(DAEMON_LOCK_FILE, "a+b")
+        fh = open(path, "a+b")
     except OSError as exc:
         logger.debug("daemon lock open failed: %s", exc)
         return False
@@ -299,40 +326,50 @@ def release_bdms_daemon_lock() -> None:
     except OSError:
         pass
     try:
-        DAEMON_LOCK_FILE.unlink(missing_ok=True)
+        _daemon_lock_file().unlink(missing_ok=True)
     except OSError:
         pass
-    try:
-        DAEMON_STATE_FILE.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
-def write_bdms_daemon_state(*, node_pid: int) -> None:
-    _ensure_guard_dir()
-    doc = {
-        "python_pid": os.getpid(),
-        "node_pid": node_pid,
-        "started_at": int(time.time()),
-    }
-    DAEMON_STATE_FILE.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def shutdown_local_nodes(*, reason: str = "") -> dict[str, Any]:
-    """Best-effort shutdown for this Python process."""
     try:
         from pigeon_protocol.foundation.bdms_node_daemon import close_daemon
 
         close_daemon()
     except Exception as exc:
         logger.debug("close bdms daemon: %s", exc)
-    killed = []
-    for pid in list(_local_registered):
-        if _kill_pid(pid):
-            killed.append(pid)
-        unregister_node_pid(pid)
+    killed = kill_registered_processes(kind="node")
     release_bdms_daemon_lock()
     return {"killed": killed, "reason": reason}
+
+
+def cleanup_project_nodes(*, kill_all: bool = True, reason: str = "", older_than_sec: int | None = None) -> dict[str, Any]:
+    """Bridge/EXE cleanup entry."""
+    if kill_all and older_than_sec is None:
+        killed = kill_registered_processes(kind="node")
+    elif older_than_sec is not None:
+        killed = kill_registered_processes(kind="node", older_than_sec=older_than_sec)
+    else:
+        cleanup_dead_registered_processes()
+        killed = 0
+    release_bdms_daemon_lock()
+    return {"ok": True, "killed": killed, "reason": reason}
+
+
+# backward-compatible aliases
+def register_node_pid(pid: int, *, kind: str = "node", owner: str = "") -> None:
+    register_child_process(kind, pid, owner or kind)
+
+
+def unregister_node_pid(pid: int) -> None:
+    unregister_child_process(pid)
+
+
+def prepare_node_spawn(*, kind: str = "node") -> tuple[bool, str]:
+    if ensure_node_capacity():
+        return True, ""
+    live = count_live_registered_processes(kind="node")
+    return False, f"node limit reached ({live}/{node_process_limit()})"
 
 
 def _atexit_cleanup() -> None:

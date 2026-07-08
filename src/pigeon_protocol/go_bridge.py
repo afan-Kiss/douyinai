@@ -130,6 +130,8 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
         "health",
         "session_keepalive",
         "process_guard_cleanup",
+        "process_status",
+        "process_cleanup",
     }
     _ensure_bridge_ready(migrate=action not in fast_actions)
 
@@ -137,14 +139,31 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
         return _ok({"pong": True, "standalone": os.getenv("PIGEON_STANDALONE")})
 
     if action == "process_guard_cleanup":
-        from pigeon_protocol.process_guard import cleanup_project_nodes, shutdown_local_nodes
+        from pigeon_protocol.process_guard import cleanup_dead_registered_processes, process_cleanup, shutdown_local_nodes
 
         shutdown_local_nodes(reason="bridge_cleanup")
-        report = cleanup_project_nodes(
-            kill_all=bool(params.get("kill_all", True)),
-            reason=str(params.get("reason") or "bridge_cleanup"),
-        )
+        older = params.get("older_than_sec")
+        if params.get("kill_all"):
+            report = process_cleanup(kill_all=True)
+        elif params.get("older_than_sec") is not None:
+            report = process_cleanup(kill_all=False, older_than_sec=int(params["older_than_sec"]))
+        else:
+            report = process_cleanup(kill_all=bool(params.get("kill_all", False)))
+        report["reason"] = str(params.get("reason") or "bridge_cleanup")
         return _ok(report)
+
+    if action == "process_status":
+        from pigeon_protocol.process_guard import process_status
+
+        return process_status()
+
+    if action == "process_cleanup":
+        from pigeon_protocol.process_guard import process_cleanup
+
+        return process_cleanup(
+            kill_all=bool(params.get("kill_all", True)),
+            older_than_sec=int(params["older_than_sec"]) if params.get("older_than_sec") is not None else None,
+        )
 
     if action == "list_accounts":
         from pigeon_protocol.account_context import account_status
@@ -675,9 +694,10 @@ def run_daemon() -> int:
         pass
 
     try:
-        from pigeon_protocol.process_guard import cleanup_project_nodes
+        from pigeon_protocol.process_guard import cleanup_dead_registered_processes, kill_registered_processes
 
-        cleanup_project_nodes(kill_all=True, reason="daemon_boot")
+        cleanup_dead_registered_processes()
+        kill_registered_processes(kind="node", older_than_sec=6 * 60 * 60)
     except Exception as exc:
         logger.debug("node cleanup on daemon boot: %s", exc)
 
