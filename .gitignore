@@ -1,0 +1,25 @@
+# Runtime / secrets
+session/
+accounts/
+standalone_bundle/
+logs/
+.env
+*.pyc
+__pycache__/
+.chrome-cdp-profile/
+.cursor/
+
+# Captures & downloads (may contain cookies/tokens)
+captures/
+downloads/
+analysis/
+
+# Node / build artifacts
+node_modules/
+dist/
+
+# Local temp
+t_req.json
+
+# Bundled toolchain archives
+tools/*.zip

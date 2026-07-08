@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="reduce-motion">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>抖店 AI 客服工作台</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="/static/styles.css"/>
+</head>
+<body>
+  <div id="globalProgress" class="global-progress" hidden aria-hidden="true">
+    <div class="global-progress-track"><div class="global-progress-bar"></div></div>
+  </div>
+  <div class="app-bg"></div>
+  <div id="toastHost" class="toast-host" aria-live="polite"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark"></span>
+      <div>
+        <strong>抖店 AI 客服工作台</strong>
+        <span class="brand-sub">纯协议 · 智能回复</span>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <select id="accountSelect" class="select account-select" title="切换账号"></select>
+      <button type="button" class="btn ghost sm" id="btnAddAccount" title="添加账号">+ 账号</button>
+      <button type="button" class="btn ghost" id="btnRefreshAll" title="刷新全部">刷新</button>
+      <button type="button" class="btn ghost" id="btnToggleOrders" title="订单侧栏">订单面板</button>
+      <span class="pill muted" id="protoPill" title="纯协议状态">协议 —</span>
+      <span class="pill" id="connPill"><span class="dot"></span>连接中</span>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <!-- 左栏 -->
+    <aside class="panel panel-left" id="panelLeft">
+      <section class="card login-card" id="loginCard">
+        <div class="card-head">
+          <h2>登录状态</h2>
+        </div>
+        <div id="loginBody" class="login-body">
+          <p class="status-line"><strong>未登录</strong></p>
+          <p class="muted">连接后端后，点击下方按钮扫码登录</p>
+          <div class="btn-row">
+            <button type="button" class="btn primary" id="btnStartQr">扫码登录</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card nav-card">
+        <div class="card-head">
+          <h2>会话分类</h2>
+        </div>
+        <nav class="conv-tabs" id="convTabs" role="tablist"></nav>
+      </section>
+
+      <section class="card list-card flex-grow">
+        <div class="card-head row-between">
+          <h2>会话列表</h2>
+          <span class="muted" id="convCount">—</span>
+        </div>
+        <div id="convList" class="conv-list">
+          <div class="skeleton-stack pad">
+            <div class="skeleton line"></div>
+            <div class="skeleton line w70"></div>
+            <div class="skeleton line w90"></div>
+          </div>
+        </div>
+      </section>
+    </aside>
+
+    <!-- 中栏 -->
+    <section class="panel panel-center" id="panelCenter">
+      <div class="chat-header card" id="chatHeader">
+        <div class="chat-header-main">
+          <div class="avatar lg" id="buyerAvatar">客</div>
+          <div>
+            <h2 id="buyerTitle">选择左侧会话</h2>
+            <p class="muted" id="buyerMeta">暂无选中买家</p>
+          </div>
+        </div>
+        <div class="chat-header-tools">
+          <label class="switch">
+            <input type="checkbox" id="humanTakeover"/>
+            <span>人工接管</span>
+          </label>
+          <select id="aiMode" class="select" title="AI 模式">
+            <option value="confirm">人工确认后发送</option>
+            <option value="auto">自动回复</option>
+            <option value="pause">暂停 AI</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="ai-status-card card" id="aiStatusCard">
+        <div class="ai-status-top">
+          <div>
+            <span class="ai-label">AI 助手</span>
+            <strong id="aiStateText">空闲</strong>
+          </div>
+          <div class="ai-pulse" id="aiPulse" hidden>
+            <span></span><span></span><span></span>
+          </div>
+        </div>
+        <div class="ai-pulse-bar" id="aiPulseBar" hidden></div>
+        <p class="ai-hint muted" id="aiHint">选中会话后，AI 会结合聊天记录和订单信息整理回复。</p>
+        <div class="ai-draft" id="aiDraft" hidden>
+          <p class="draft-label">推荐回复</p>
+          <div class="draft-text" id="aiDraftText"></div>
+          <div class="btn-row">
+            <button type="button" class="btn primary" id="btnSendAi">一键发送</button>
+            <button type="button" class="btn" id="btnRegenAi">重新生成</button>
+            <button type="button" class="btn ghost" id="btnCopyAi">复制回复</button>
+            <button type="button" class="btn warn" id="btnHumanAi">转人工</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="messages card flex-grow" id="messageArea">
+        <div class="empty-state" id="msgEmpty">
+          <div class="empty-icon">💬</div>
+          <p>还没有选中会话</p>
+          <span class="muted">从左侧选一个买家，或等待新消息进来</span>
+        </div>
+        <div id="messageList" class="message-list" hidden></div>
+      </div>
+
+      <div class="composer card">
+        <div class="composer-tools">
+          <button type="button" class="chip" id="btnQuickPhrase">快捷话术</button>
+          <span class="muted composer-mode" id="composerMode">当前：人工确认后发送</span>
+        </div>
+        <div class="composer-row">
+          <textarea id="composerInput" rows="2" placeholder="输入回复内容，或让 AI 帮你整理…"></textarea>
+          <div class="composer-actions">
+            <button type="button" class="btn ai" id="btnAiGen">AI 生成</button>
+            <button type="button" class="btn primary" id="btnSend">发送</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 右栏 -->
+    <aside class="panel panel-right" id="panelRight">
+      <section class="card buyer-overview" id="buyerOverview">
+        <div class="card-head"><h2>买家概览</h2></div>
+        <div id="buyerOverviewBody" class="overview-body">
+          <div class="empty-mini muted">选中会话后显示买家信息</div>
+        </div>
+      </section>
+
+      <section class="card order-card" id="orderCard">
+        <div class="card-head row-between">
+          <h2>当前订单</h2>
+          <button type="button" class="btn ghost sm" id="btnRetryOrders">重试</button>
+        </div>
+        <div id="orderBody" class="order-body">
+          <div class="skeleton-stack pad">
+            <div class="skeleton block h80"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card insight-card" id="insightCard">
+        <div class="card-head"><h2>AI 辅助判断</h2></div>
+        <div id="insightBody" class="insight-body">
+          <div class="empty-mini muted">AI 会识别买家意图并给出回复建议</div>
+        </div>
+      </section>
+
+      <section class="card actions-card">
+        <div class="card-head"><h2>快捷操作</h2></div>
+        <div class="action-grid">
+          <button type="button" class="btn ghost" id="actCopyOrder">复制订单信息</button>
+          <button type="button" class="btn ghost" id="actCopyBuyer">复制买家信息</button>
+          <button type="button" class="btn ghost" id="actMarkHuman">标记需人工</button>
+          <button type="button" class="btn ghost" id="actRisk">加入售后关注</button>
+        </div>
+      </section>
+    </aside>
+  </main>
+
+  <!-- 小屏订单抽屉 -->
+  <div class="drawer-backdrop" id="drawerBackdrop" hidden></div>
+  <aside class="drawer" id="orderDrawer" hidden aria-label="订单抽屉">
+    <div class="drawer-head">
+      <h2>买家订单</h2>
+      <button type="button" class="btn ghost sm" id="btnCloseDrawer">关闭</button>
+    </div>
+    <div id="drawerOrderBody" class="drawer-body"></div>
+  </aside>
+
+
+  <script src="/static/app.js?v=20260708d" defer></script>
+</body>
+</html>
