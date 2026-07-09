@@ -395,18 +395,17 @@ func (c *Client) EnsureDaemonWait(maxWait time.Duration) bool {
 		c.startMu.Lock()
 		c.mu.Lock()
 		live = c.isDaemonLiveLocked()
+		c.mu.Unlock()
 		if live {
-			c.mu.Unlock()
 			c.startMu.Unlock()
 			return true
 		}
-		c.mu.Unlock()
+		c.startMu.Unlock()
 
 		ok := c.startDaemon()
 		c.mu.Lock()
 		c.daemonOK = ok
 		c.mu.Unlock()
-		c.startMu.Unlock()
 
 		if ok {
 			return true

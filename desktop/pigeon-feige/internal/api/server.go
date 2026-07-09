@@ -219,7 +219,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	pingMs := -1
 	if pythonLive {
 		t0 := time.Now()
-		_, err := s.Bridge.Call("ping", nil)
+		_, err := bridgeCallWithTimeout(s.Bridge, "ping", map[string]any{"oneshot": true}, 3*time.Second)
 		pingMs = int(time.Since(t0).Milliseconds())
 		s.Bridge.RecordPingMs(int64(pingMs))
 		bridgeReady = err == nil
@@ -888,9 +888,11 @@ func (s *Server) handleSessionBootstrap(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, 405, map[string]any{"ok": false})
 		return
 	}
-	out, err := s.Bridge.Call("session_bootstrap", readJSON(r))
+	params := readJSON(r)
+	params["oneshot"] = true
+	out, err := bridgeCallWithTimeout(s.Bridge, "session_bootstrap", params, 3*time.Second)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeJSON(w, 200, map[string]any{"ok": true, "started": false, "degraded": true, "error": err.Error()})
 		return
 	}
 	writeJSON(w, 200, out)
@@ -910,9 +912,9 @@ func (s *Server) handleSessionRenew(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSessionKeepalive(w http.ResponseWriter, r *http.Request) {
-	out, err := s.Bridge.Call("session_keepalive", map[string]any{"tick": true})
+	out, err := bridgeCallWithTimeout(s.Bridge, "session_keepalive", map[string]any{"tick": true, "oneshot": true}, 5*time.Second)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeJSON(w, 200, map[string]any{"ok": true, "degraded": true, "error": err.Error()})
 		return
 	}
 	writeJSON(w, 200, out)
@@ -1066,9 +1068,17 @@ func (s *Server) handleAISuggest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleProtocolStatus(w http.ResponseWriter, r *http.Request) {
-	out, err := s.Bridge.Call("protocol_status", nil)
+	out, err := bridgeCallWithTimeout(s.Bridge, "protocol_status", map[string]any{"oneshot": true}, 15*time.Second)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeJSON(w, 200, map[string]any{
+			"ok":             false,
+			"foundation_ok":  false,
+			"send_ready":     false,
+			"listen_ready":   false,
+			"conv_snapshot":  false,
+			"degraded":       true,
+			"error":          err.Error(),
+		})
 		return
 	}
 	writeJSON(w, 200, out)

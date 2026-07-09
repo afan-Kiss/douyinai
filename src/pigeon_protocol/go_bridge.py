@@ -129,6 +129,8 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
         "list_accounts",
         "health",
         "session_keepalive",
+        "session_bootstrap",
+        "protocol_status",
         "process_guard_cleanup",
         "process_status",
         "process_cleanup",

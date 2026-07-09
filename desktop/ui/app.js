@@ -454,7 +454,7 @@
 
   async function refreshLogin(forceConv = false) {
     try {
-      const j = await api("/api/session", BG_API);
+      const j = await api("/api/session?light=1", BG_API);
       const { activeRow } = syncLoginState(j);
       if (state.qrPollingActive && !state.loggedIn) {
         renderAccountPicker();
@@ -887,15 +887,17 @@
     _qrImgTimer = null;
   }
 
-  async function waitBridgeReady(maxMs = 25000) {
+  async function waitBridgeReady(maxMs = 15000) {
     const start = Date.now();
     while (Date.now() - start < maxMs) {
-      const s = await api("/api/session", { trackProgress: false });
-      if (s && (s.accounts || s.logged_in !== undefined || s.cookie_count !== undefined)) {
+      const h = await api("/api/health", { trackProgress: false, timeoutMs: 4000 });
+      if (h.bridge_ready === true || (h.ok !== false && h.go_api_ok === true && !h.degraded)) {
         return true;
       }
-      const h = await api("/api/health", { trackProgress: false });
-      if (h.ok !== false && !h.health?.bridge) return true;
+      const s = await api("/api/session?light=1", { trackProgress: false, timeoutMs: 4000 });
+      if (s && (s.accounts || s.logged_in !== undefined)) {
+        if (h.ok !== false) return true;
+      }
       setConn(true, "Bridge 初始化中…");
       await new Promise((r) => setTimeout(r, 600));
     }
@@ -1858,15 +1860,14 @@
     renderConvTabs();
     setConn(true, "连接中…");
     await waitBridgeReady();
-    const h = await api("/api/health", BG_API);
-    const bridgeErr = h.health?.bridge;
-    if (h.ok === false) setConn(false, h.error || "后端异常");
-    else if (bridgeErr) setConn(true, "Bridge 初始化中");
+    const h = await api("/api/health", { ...BG_API, timeoutMs: 5000 });
+    if (h.ok === false && !h.go_api_ok) setConn(false, h.error || "后端异常");
+    else if (h.degraded || h.bridge_ready === false) setConn(true, "Bridge 初始化中");
     else setConn(true, "连接正常");
-    void api("/api/session/bootstrap", { method: "POST", body: "{}", ...BG_API });
-    void api("/api/session/keepalive", { method: "POST", body: "{}", ...BG_API });
+    void api("/api/session/bootstrap", { method: "POST", body: "{}", ...BG_API, timeoutMs: 3000 });
+    void api("/api/session/keepalive", { method: "POST", body: "{}", ...BG_API, timeoutMs: 5000 });
     await refreshLogin();
-    await refreshProtocolStatus();
+    void refreshProtocolStatus();
     setInterval(pollEvents, 2000);
     setInterval(() => {
       if (state.loggedIn && !state.qrPollingActive) {
