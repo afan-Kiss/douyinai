@@ -287,8 +287,45 @@
     await refreshLogin();
   }
 
+  function cleanBuyerName(name) {
+    if (name == null) return "";
+    const s = String(name).trim();
+    if (!s) return "";
+    const lower = s.toLowerCase();
+    const bad = new Set([
+      "其他", "未知", "未知买家", "站内push推送", "站内push", "抖音",
+      "今日头条", "火山", "来源", "用户", "买家", "暂无", "null", "none", "undefined",
+    ]);
+    if (bad.has(s) || bad.has(lower)) return "";
+    if (/fallback|xundan\s*11001|已知买家\s*[（(]/i.test(s)) return "";
+    if (lower.includes("fallback")) return "";
+    return s;
+  }
+
+  function convPreview(c) {
+    const raw = String(c.preview || "").trim();
+    if (!raw) return "暂无消息";
+    if (/已知买家\s*[（(].*fallback/i.test(raw)) return "已知买家";
+    if (/xundan\s*11001\s*fallback/i.test(raw)) return "已知买家";
+    if (/fallback/i.test(raw) && raw.includes("已知买家")) return "已知买家";
+    return raw;
+  }
+
   function convName(c) {
-    return c.name || c.buyer_name || "买家" + (c.security_user_id || "").slice(-6);
+    const candidates = [
+      c.display_name,
+      c.buyer_name,
+      c.name,
+      c.nickname,
+      c.nick_name,
+      c.user_name,
+    ];
+    for (const v of candidates) {
+      const cleaned = cleanBuyerName(v);
+      if (cleaned) return cleaned;
+    }
+    const uid = String(c.security_user_id || "");
+    return uid ? `买家 ${uid.slice(-6)}` : "未知买家";
   }
 
   function avatarChar(name) {
@@ -1085,7 +1122,7 @@
               ${unread > 0 ? `<span class="unread-badge">${unread > 99 ? "99+" : unread}</span>` : ""}
             </div>
           </div>
-          <div class="preview">${escapeHtml(c.preview || meta.lastPreview || "暂无消息")}</div>
+          <div class="preview">${escapeHtml(convPreview(c) || meta.lastPreview || "暂无消息")}</div>
           <div class="meta">${tags.join("")}</div>
         </div>`;
       })
@@ -1147,7 +1184,11 @@
     const name = conv ? convName(conv) : "买家";
     $("buyerTitle").textContent = name;
     $("buyerAvatar").textContent = avatarChar(name);
-    $("buyerMeta").textContent = "正在加载聊天记录…";
+    const uidTail = uid ? uid.slice(-6) : "";
+    const sourceHint = conv?.buyer_source ? ` · 来源：${conv.buyer_source}` : "";
+    $("buyerMeta").textContent = uidTail
+      ? `UID 尾号 ${uidTail}${sourceHint} · 正在加载聊天记录…`
+      : `正在加载聊天记录…`;
     if (state.convMeta[uid]) {
       state.convMeta[uid].unread = false;
     }
@@ -1178,10 +1219,11 @@
 
     const meta = state.convMeta[uid] || {};
     meta.hasOrder = hasOrdData;
-    meta.buyerName = ctxRes.context?.buyer_name || name;
+    meta.buyerName = cleanBuyerName(ctxRes.context?.buyer_name) || name;
     state.convMeta[uid] = meta;
 
-    $("buyerMeta").textContent = `最近活跃 · ${state.messages.length} 条消息${meta.hasOrder ? " · 有订单" : ""}`;
+    const srcHint = conv?.buyer_source ? ` · 来源：${conv.buyer_source}` : "";
+    $("buyerMeta").textContent = `最近活跃 · ${state.messages.length} 条消息${meta.hasOrder ? " · 有订单" : ""}${srcHint}`;
     renderMessages();
     renderOrders();
     renderBuyerOverview();

@@ -506,23 +506,24 @@ def _parse_unread(it: dict[str, Any], msg_body: dict[str, Any], ext: dict[str, A
 
 
 def parse_conversation_items(raw: dict[str, Any]) -> list[dict[str, Any]]:
-    if raw.get("items") and isinstance(raw["items"], list):
-        return raw["items"]
-
-    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
-    inner = data.get("data") if isinstance(data.get("data"), (list, dict)) else data
     items: list[Any] = []
 
-    if isinstance(inner, list):
-        items = inner
-    elif isinstance(inner, dict):
-        items = (
-            inner.get("user_list")
-            or inner.get("conversation_list")
-            or inner.get("list")
-            or inner.get("items")
-            or []
-        )
+    if raw.get("items") and isinstance(raw["items"], list):
+        items = raw["items"]
+    else:
+        data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+        inner = data.get("data") if isinstance(data.get("data"), (list, dict)) else data
+
+        if isinstance(inner, list):
+            items = inner
+        elif isinstance(inner, dict):
+            items = (
+                inner.get("user_list")
+                or inner.get("conversation_list")
+                or inner.get("list")
+                or inner.get("items")
+                or []
+            )
 
     out: list[dict[str, Any]] = []
     for it in items:
@@ -541,16 +542,17 @@ def parse_conversation_items(raw: dict[str, Any]) -> list[dict[str, Any]]:
         if not uid:
             uid = str(ext.get("security_pigeon_uid") or ext.get("s:security_invisible") or "")
 
-        name = str(
-            it.get("user_name")
-            or it.get("nick_name")
-            or (it.get("user_info") or {}).get("user_name")
-            or it.get("title")
-            or (it.get("ext") or {}).get("user_name")
-            or ext.get("cname")
-            or ext.get("uname")
-            or ""
+        from pigeon_protocol.buyer_display_name import (
+            buyer_label_from_uid,
+            extract_conversation_display_name,
+            sanitize_conv_preview,
         )
+
+        name, name_source = extract_conversation_display_name(it, msg_body, ext)
+        if not name:
+            name = buyer_label_from_uid(uid) if uid else "未知买家"
+            name_source = name_source or "uid_tail"
+
         preview = str(
             it.get("last_message")
             or it.get("preview")
@@ -560,6 +562,7 @@ def parse_conversation_items(raw: dict[str, Any]) -> list[dict[str, Any]]:
             or ext.get("cs_special_content")
             or ""
         )
+        preview = sanitize_conv_preview(preview) or preview
         talk_id = str(
             it.get("talk_id")
             or last_msg.get("server_message_id")
@@ -572,6 +575,9 @@ def parse_conversation_items(raw: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "security_user_id": uid,
                 "name": name,
+                "buyer_name": name,
+                "display_name": name,
+                "name_source": name_source,
                 "preview": preview[:120],
                 "talk_id": talk_id,
                 "queue_key": it.get("_queue_key") or "",
