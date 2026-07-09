@@ -312,6 +312,14 @@ func (c *Client) callTimeout(action string) time.Duration {
 	switch action {
 	case "ping", "session_status", "list_accounts", "qr_login_status", "listen_status", "health", "process_status":
 		return 5 * time.Second
+	case "conv_list":
+		return 5 * time.Second
+	case "context":
+		return 8 * time.Second
+	case "orders":
+		return 8 * time.Second
+	case "send":
+		return 15 * time.Second
 	case "qr_login_start":
 		return 8 * time.Second
 	case "prepare_pure", "warm_conv", "session_doctor":

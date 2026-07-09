@@ -524,29 +524,88 @@ func (s *Server) applyUnreadBumps(out map[string]any) {
 	}
 }
 
+func degradedContextPayload(msg string) map[string]any {
+	return map[string]any{
+		"ok": false,
+		"context": map[string]any{
+			"messages":   []any{},
+			"buyer_name": "",
+			"source":     "degraded",
+		},
+		"message_count": 0,
+		"error":         msg,
+	}
+}
+
+func degradedOrdersPayload(msg string) map[string]any {
+	return map[string]any{
+		"ok":        false,
+		"order_ok":  false,
+		"has_order": false,
+		"orders": map[string]any{
+			"has_order": false,
+			"cards":     []any{},
+			"summary":   "订单暂时不可用",
+		},
+		"source": "degraded",
+		"error":  msg,
+	}
+}
+
+func bridgeCallWithTimeout(b *bridge.Client, action string, params map[string]any, timeout time.Duration) (map[string]any, error) {
+	type result struct {
+		out map[string]any
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		out, err := b.Call(action, params)
+		ch <- result{out: out, err: err}
+	}()
+	select {
+	case res := <-ch:
+		return res.out, res.err
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("%s timeout", action)
+	}
+}
+
 func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 	uid := r.URL.Query().Get("user_id")
 	if uid == "" {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "user_id required"})
 		return
 	}
-	out, err := s.Bridge.Call("context", map[string]any{"user_id": uid})
-	if err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
-		return
-	}
+	out, err := bridgeCallWithTimeout(s.Bridge, "context", map[string]any{"user_id": uid}, 8*time.Second)
 	s.mu.Lock()
 	aid := s.activeAccountID()
 	if aid != "" && s.unread[aid] != nil {
 		delete(s.unread[aid], uid)
 	}
 	s.mu.Unlock()
-	ctx, _ := out["context"]
+	if err != nil {
+		writeJSON(w, 200, degradedContextPayload("聊天记录暂时不可用"))
+		return
+	}
+	ctx, _ := out["context"].(map[string]any)
+	if ctx == nil {
+		writeJSON(w, 200, degradedContextPayload("聊天记录暂时不可用"))
+		return
+	}
+	if _, ok := ctx["messages"]; !ok {
+		ctx["messages"] = []any{}
+	}
 	msgCount := 0
 	if mc, ok := out["message_count"].(float64); ok {
 		msgCount = int(mc)
+	} else if msgs, ok := ctx["messages"].([]any); ok {
+		msgCount = len(msgs)
 	}
-	writeJSON(w, 200, map[string]any{"ok": msgCount > 0, "context": ctx})
+	resp := map[string]any{"ok": msgCount > 0, "context": ctx, "message_count": msgCount}
+	if e, _ := out["error"].(string); e != "" {
+		resp["error"] = e
+	}
+	writeJSON(w, 200, resp)
 }
 
 func (s *Server) handleOrders(w http.ResponseWriter, r *http.Request) {
@@ -555,10 +614,18 @@ func (s *Server) handleOrders(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "user_id required"})
 		return
 	}
-	out, err := s.Bridge.Call("orders", map[string]any{"user_id": uid})
+	out, err := bridgeCallWithTimeout(s.Bridge, "orders", map[string]any{"user_id": uid}, 8*time.Second)
 	if err != nil {
-		writeJSON(w, 500, map[string]any{"ok": false, "error": err.Error()})
+		writeJSON(w, 200, degradedOrdersPayload("订单加载失败，可稍后重试"))
 		return
+	}
+	orders, _ := out["orders"].(map[string]any)
+	if orders == nil {
+		writeJSON(w, 200, degradedOrdersPayload("订单加载失败，可稍后重试"))
+		return
+	}
+	if _, ok := orders["cards"]; !ok {
+		orders["cards"] = []any{}
 	}
 	ok := false
 	if v, _ := out["order_ok"].(bool); v {
@@ -567,15 +634,13 @@ func (s *Server) handleOrders(w http.ResponseWriter, r *http.Request) {
 	if v, _ := out["has_order"].(bool); v {
 		ok = true
 	}
-	if orders, _ := out["orders"].(map[string]any); orders != nil {
-		if cards, _ := orders["cards"].([]any); len(cards) > 0 {
-			ok = true
-		}
-		if v, _ := orders["has_order"].(bool); v {
-			ok = true
-		}
+	if v, _ := orders["has_order"].(bool); v {
+		ok = true
 	}
-	resp := map[string]any{"ok": ok, "orders": out["orders"], "source": out["source"], "order_ok": ok}
+	if cards, _ := orders["cards"].([]any); len(cards) > 0 {
+		ok = true
+	}
+	resp := map[string]any{"ok": ok, "orders": orders, "source": out["source"], "order_ok": ok}
 	if e, _ := out["error"].(string); e != "" {
 		resp["error"] = e
 	}

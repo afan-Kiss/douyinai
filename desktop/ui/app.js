@@ -48,6 +48,7 @@
     ordersLoading: false,
     ordersError: "",
     contextLoading: false,
+    contextError: "",
     listenOn: false,
     eventSince: 0,
     aiMode: "confirm",
@@ -112,6 +113,7 @@
     state.ordersLoading = false;
     state.ordersError = "";
     state.contextLoading = false;
+    state.contextError = "";
     state.aiDraft = "";
     state.aiIntent = "";
     state.aiState = "idle";
@@ -135,13 +137,42 @@
     $("convList").innerHTML = '<div class="empty-mini muted">切换账号后请刷新会话列表</div>';
   }
 
+  let _progressCount = 0;
+  let _progressTimer = null;
+  let _selectReqSeq = 0;
+  let _contextLoadGen = 0;
+  let _ordersLoadGen = 0;
+
   async function api(path, opt = {}) {
     const track = opt.trackProgress === true;
+    const timeoutMs = Number(opt.timeoutMs || 8000);
+    const throwOnError = opt.throwOnError;
+    const externalSignal = opt.signal;
+    const {
+      trackProgress: _trackProgress,
+      timeoutMs: _timeoutMs,
+      throwOnError: _throwOnError,
+      signal: _extSignal,
+      headers: extraHeaders,
+      ...fetchRest
+    } = opt;
+
     if (track) showGlobalProgress();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        controller.abort();
+      } else {
+        externalSignal.addEventListener("abort", () => controller.abort(), { once: true });
+      }
+    }
+
     try {
       const r = await fetch(path, {
-        headers: { "Content-Type": "application/json", ...(opt.headers || {}) },
-        ...opt,
+        ...fetchRest,
+        headers: { "Content-Type": "application/json", ...(extraHeaders || {}) },
+        signal: controller.signal,
       });
       const ct = r.headers.get("content-type") || "";
       let data = {};
@@ -160,9 +191,14 @@
       }
       return data;
     } catch (e) {
-      if (opt.throwOnError) throw e;
+      if (e && e.name === "AbortError") {
+        if (throwOnError) throw e;
+        return { ok: false, timeout: true, error: "请求超时" };
+      }
+      if (throwOnError) throw e;
       return { ok: false, error: e.message || String(e) };
     } finally {
+      clearTimeout(timer);
       if (track) hideGlobalProgress();
     }
   }
@@ -1147,7 +1183,10 @@
       if (!heavy) qs.set("light", "1");
       const j = await api(
         `/api/conversations?${qs}`,
-        showProgress ? { trackProgress: true } : BG_API
+        {
+          ...(showProgress ? { trackProgress: true } : BG_API),
+          timeoutMs: heavy ? 8000 : 5000,
+        }
       );
       if (!j.ok && !(j.items || []).length) {
         toast((j.raw && j.raw.error) || j.error || "会话列表拉取失败，可点刷新重试");
@@ -1177,62 +1216,148 @@
   }
 
   /* ——— 选中会话 ——— */
+  function updateBuyerMeta(uid) {
+    const conv = state.conversations.find((c) => c.security_user_id === uid);
+    const meta = state.convMeta[uid] || {};
+    const uidTail = uid ? uid.slice(-6) : "";
+    const srcHint = conv?.buyer_source ? ` · 来源：${conv.buyer_source}` : "";
+    if (state.contextLoading) {
+      $("buyerMeta").textContent = uidTail
+        ? `UID 尾号 ${uidTail}${srcHint} · 正在加载聊天记录…`
+        : "正在加载聊天记录…";
+      return;
+    }
+    $("buyerMeta").textContent = `最近活跃 · ${state.messages.length} 条消息${meta.hasOrder ? " · 有订单" : ""}${srcHint}`;
+  }
+
+  async function loadConversationContext(uid, selectSeq) {
+    const loadGen = ++_contextLoadGen;
+    state.contextLoading = true;
+    state.contextError = "";
+    renderMessages();
+
+    const ctxRes = await api("/api/context?user_id=" + encodeURIComponent(uid), {
+      ...BG_API,
+      timeoutMs: 6000,
+    });
+
+    if (selectSeq !== _selectReqSeq || uid !== state.currentUid || loadGen !== _contextLoadGen) {
+      return;
+    }
+
+    state.contextLoading = false;
+    const ctx = ctxRes.context && typeof ctxRes.context === "object" ? ctxRes.context : {};
+    const msgs = Array.isArray(ctx.messages) ? ctx.messages : [];
+
+    if (ctxRes.timeout) {
+      state.messages = [];
+      state.contextError = "聊天记录加载超时，可点击重试";
+    } else if (ctxRes.error && !msgs.length && ctxRes.ok === false) {
+      state.messages = [];
+      state.contextError = ctxRes.error || "聊天记录加载失败，可点击重试";
+    } else {
+      state.messages = msgs;
+      state.contextError = "";
+      const conv = state.conversations.find((c) => c.security_user_id === uid);
+      const fallbackName = conv ? convName(conv) : "买家";
+      const meta = state.convMeta[uid] || {};
+      meta.buyerName = cleanBuyerName(ctx.buyer_name) || fallbackName;
+      state.convMeta[uid] = meta;
+    }
+
+    updateBuyerMeta(uid);
+    renderMessages();
+    renderBuyerOverview();
+    renderInsight();
+
+    if (!state.contextError && state.aiMode === "auto" && !state.humanTakeover && !state.markedHuman.has(uid)) {
+      const last = [...state.messages].reverse().find((m) => isBuyerRole(m.role));
+      if (last) void generateAiReply(last.text);
+    }
+  }
+
+  async function loadConversationOrders(uid, selectSeq) {
+    const loadGen = ++_ordersLoadGen;
+    state.ordersLoading = true;
+    state.ordersError = "";
+    renderOrders();
+
+    const ordRes = await api("/api/orders?user_id=" + encodeURIComponent(uid), {
+      ...BG_API,
+      timeoutMs: 8000,
+    });
+
+    if (selectSeq !== _selectReqSeq || uid !== state.currentUid || loadGen !== _ordersLoadGen) {
+      return;
+    }
+
+    state.ordersLoading = false;
+    state.orders = ordRes.orders && typeof ordRes.orders === "object" ? ordRes.orders : null;
+    const cards = orderCards(state.orders);
+    const hasOrdData = Boolean(state.orders?.has_order || cards.length);
+
+    if (ordRes.timeout) {
+      state.orders = null;
+      state.ordersError = "订单加载超时，可点击右上角重试";
+    } else if (ordRes.error && !hasOrdData) {
+      state.ordersError = ordRes.error;
+      if (!state.orders) {
+        state.orders = { has_order: false, cards: [], summary: ordRes.error };
+      }
+    } else if (!hasOrdData && ordRes.order_ok === false && ordRes.error) {
+      state.ordersError = ordRes.error;
+    } else {
+      state.ordersError = "";
+    }
+
+    const meta = state.convMeta[uid] || {};
+    meta.hasOrder = hasOrdData;
+    state.convMeta[uid] = meta;
+
+    renderOrders();
+    renderBuyerOverview();
+    renderInsight();
+    updateBuyerMeta(uid);
+  }
+
+  function retryCurrentContext() {
+    const uid = state.currentUid;
+    if (!uid) return Promise.resolve();
+    return loadConversationContext(uid, _selectReqSeq);
+  }
+
+  function retryCurrentOrders() {
+    const uid = state.currentUid;
+    if (!uid) return Promise.resolve();
+    return loadConversationOrders(uid, _selectReqSeq);
+  }
+
   async function selectConversation(uid) {
     if (!uid) return;
+    const reqId = ++_selectReqSeq;
     state.currentUid = uid;
     const conv = state.conversations.find((c) => c.security_user_id === uid);
     const name = conv ? convName(conv) : "买家";
     $("buyerTitle").textContent = name;
     $("buyerAvatar").textContent = avatarChar(name);
-    const uidTail = uid ? uid.slice(-6) : "";
-    const sourceHint = conv?.buyer_source ? ` · 来源：${conv.buyer_source}` : "";
-    $("buyerMeta").textContent = uidTail
-      ? `UID 尾号 ${uidTail}${sourceHint} · 正在加载聊天记录…`
-      : `正在加载聊天记录…`;
     if (state.convMeta[uid]) {
       state.convMeta[uid].unread = false;
     }
     void api("/api/conversations/ack", { method: "POST", body: JSON.stringify({ user_id: uid }), ...BG_API });
     renderConvList();
 
+    state.messages = [];
+    state.orders = null;
     state.contextLoading = true;
     state.ordersLoading = true;
+    state.contextError = "";
     state.ordersError = "";
-    renderMessagesSkeleton();
-    renderOrderSkeleton();
-
-    const [ctxRes, ordRes] = await Promise.all([
-      api("/api/context?user_id=" + encodeURIComponent(uid), BG_API),
-      api("/api/orders?user_id=" + encodeURIComponent(uid), BG_API),
-    ]);
-
-    state.contextLoading = false;
-    state.ordersLoading = false;
-    state.messages = ctxRes.context?.messages || [];
-    state.orders = ordRes.orders || null;
-    const hasOrdData = Boolean(state.orders?.has_order || orderCards(state.orders).length);
-    if (ordRes.error && !hasOrdData) {
-      state.ordersError = ordRes.error;
-    } else if (!hasOrdData && ordRes.order_ok === false && ordRes.error) {
-      state.ordersError = ordRes.error;
-    }
-
-    const meta = state.convMeta[uid] || {};
-    meta.hasOrder = hasOrdData;
-    meta.buyerName = cleanBuyerName(ctxRes.context?.buyer_name) || name;
-    state.convMeta[uid] = meta;
-
-    const srcHint = conv?.buyer_source ? ` · 来源：${conv.buyer_source}` : "";
-    $("buyerMeta").textContent = `最近活跃 · ${state.messages.length} 条消息${meta.hasOrder ? " · 有订单" : ""}${srcHint}`;
+    updateBuyerMeta(uid);
     renderMessages();
     renderOrders();
-    renderBuyerOverview();
-    renderInsight();
 
-    if (state.aiMode === "auto" && !state.humanTakeover && !state.markedHuman.has(uid)) {
-      const last = [...state.messages].reverse().find((m) => isBuyerRole(m.role));
-      if (last) void generateAiReply(last.text);
-    }
+    void loadConversationContext(uid, reqId);
+    void loadConversationOrders(uid, reqId);
   }
 
   function renderMessagesSkeleton() {
@@ -1244,10 +1369,32 @@
   function renderMessages() {
     const list = $("messageList");
     const empty = $("msgEmpty");
+
+    if (state.contextLoading) {
+      renderMessagesSkeleton();
+      return;
+    }
+
+    if (state.contextError) {
+      empty.hidden = true;
+      list.hidden = false;
+      list.innerHTML = `
+        <div class="context-error">
+          <strong>聊天记录加载失败</strong><br/>
+          ${escapeHtml(state.contextError)}
+          <div class="retry-row"><button type="button" class="btn ghost sm" data-action="retry-context">重试聊天记录</button></div>
+        </div>`;
+      const btn = list.querySelector('[data-action="retry-context"]');
+      if (btn) btn.addEventListener("click", () => void retryCurrentContext());
+      return;
+    }
+
     if (!state.messages.length) {
       list.hidden = true;
       empty.hidden = false;
       empty.querySelector("p").textContent = "暂无历史消息";
+      const hint = empty.querySelector(".muted");
+      if (hint) hint.textContent = "有新消息后会显示在这里";
       return;
     }
     empty.hidden = true;
@@ -1345,15 +1492,18 @@
       renderOrderSkeleton();
       return;
     }
+    if (state.ordersError) {
+      const html = `<div class="order-error">
+          <strong>订单加载失败</strong><br/>${escapeHtml(state.ordersError)}
+          <div class="retry-hint">点击右上角「重试」重新加载订单</div>
+        </div>`;
+      body.innerHTML = html;
+      drawer.innerHTML = html;
+      return;
+    }
     const cards = orderCards(o);
     if (!o || (!o.has_order && !cards.length)) {
-      let html = `<div class="empty-mini">该买家暂无订单<br/><span class="muted">有新订单后会显示在这里</span></div>`;
-      if (state.ordersError) {
-        html = `<div class="order-error">
-          <strong>订单加载失败</strong><br/>${escapeHtml(state.ordersError)}
-          <div class="retry-hint">点击右上角「重试」或切换会话后重新加载</div>
-        </div>`;
-      }
+      const html = `<div class="empty-mini">该买家暂无订单<br/><span class="muted">有新订单后会显示在这里</span></div>`;
       body.innerHTML = html;
       drawer.innerHTML = html;
       return;
@@ -1667,7 +1817,7 @@
     });
     $("btnRetryOrders").addEventListener("click", () => {
       if (!state.currentUid) return;
-      withBtnLoading($("btnRetryOrders"), () => selectConversation(state.currentUid));
+      withBtnLoading($("btnRetryOrders"), () => retryCurrentOrders());
     });
     $("btnQuickPhrase").addEventListener("click", () => {
       $("composerInput").value = "亲，您把看中的那款发我，我帮您看下细节和证书，咱不盲拍～";
