@@ -57,6 +57,11 @@ if (-not (Assert-AcceptanceServiceReady -BaseUrl $BaseUrl)) {
     exit 1
 }
 
+if (Get-Command Wait-AcceptanceDaemonReady -ErrorAction SilentlyContinue) {
+    Wait-AcceptanceDaemonReady | Out-Null
+    Start-Sleep -Milliseconds 300
+}
+
 $before = Get-AcceptanceProjectCounts
 $cases = @(
     (Measure-Case -Label 'session' -Path '/api/session?light=1')

@@ -195,6 +195,18 @@ if (Get-Command Get-AcceptanceProjectCounts -ErrorAction SilentlyContinue) {
     }
 }
 
+if (-not $script:fail) {
+    Write-Host "  closing GUI (CloseMainWindow)..." -ForegroundColor Green
+    $close = Wait-GuiGracefulExit -CloseWaitSec 15 -Retries 4
+    if ($close.ok) {
+        Write-Host "  [PASS] $($close.message)" -ForegroundColor Green
+    }
+    else {
+        Fail-Now ("GUI close failed: $($close.message)")
+        Get-Process pigeon-feige -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Write-Host ""
 if ($script:fail) {
     Write-GuiCrashDiagnostics

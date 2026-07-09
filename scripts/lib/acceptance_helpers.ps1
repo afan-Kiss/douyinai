@@ -212,3 +212,69 @@ function Invoke-AcceptanceHotPath {
     $code = if ($lines.Count -ge 2) { [int]$lines[-1] } else { 0 }
     return @{ ms = $ms; code = $code; ok = ($code -ge 200 -and $code -lt 300) }
 }
+
+function Initialize-GuiCloseWin32 {
+    if (-not ("Win32.NativeMethods" -as [type])) {
+        Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition @'
+[DllImport("user32.dll", CharSet=CharSet.Auto)]
+public static extern bool PostMessage(System.IntPtr hWnd, uint Msg, System.IntPtr wParam, System.IntPtr lParam);
+[DllImport("user32.dll", CharSet=CharSet.Auto)]
+public static extern IntPtr SendMessage(System.IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+'@
+    }
+}
+
+function Request-GuiClose {
+    Initialize-GuiCloseWin32
+    $procs = @(Get-Process pigeon-feige -ErrorAction SilentlyContinue)
+    if ($procs.Count -eq 0) { return $false }
+    $WM_CLOSE = 0x0010
+    foreach ($p in $procs) {
+        try {
+            if ($p.MainWindowHandle -ne [IntPtr]::Zero) {
+                [void][Win32.NativeMethods]::PostMessage($p.MainWindowHandle, $WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
+                [void]$p.CloseMainWindow()
+            }
+            else {
+                [void]$p.CloseMainWindow()
+            }
+        }
+        catch {}
+    }
+    return $true
+}
+
+function Test-Port8765Released {
+    $pids = Get-AcceptancePort8765Pids
+    return ($pids.Count -eq 0)
+}
+
+function Wait-GuiGracefulExit {
+    param(
+        [int]$CloseWaitSec = 15,
+        [int]$Retries = 4
+    )
+    $requested = Request-GuiClose
+    if (-not $requested) {
+        return @{ ok = $true; graceful = $true; message = 'already exited' }
+    }
+    for ($try = 0; $try -lt $Retries; $try++) {
+        for ($i = 0; $i -lt $CloseWaitSec; $i++) {
+            $feige = @(Get-Process pigeon-feige -ErrorAction SilentlyContinue).Count
+            if ($feige -eq 0 -and (Test-Port8765Released)) {
+                return @{ ok = $true; graceful = $true; message = 'exe and port released' }
+            }
+            Start-Sleep -Seconds 1
+        }
+        if ($try -lt ($Retries - 1)) {
+            Request-GuiClose | Out-Null
+        }
+    }
+    $feigeLeft = @(Get-Process pigeon-feige -ErrorAction SilentlyContinue).Count
+    $portPids = Get-AcceptancePort8765Pids
+    return @{
+        ok        = ($feigeLeft -eq 0 -and $portPids.Count -eq 0)
+        graceful  = $false
+        message   = "feige=$feigeLeft port=$($portPids -join ',')"
+    }
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
@@ -23,7 +24,11 @@ import (
 
 const apiURL = "http://127.0.0.1:8765/"
 
-var goAPIServer *api.Server
+var (
+	goAPIServer *api.Server
+	apiListener net.Listener
+	httpServer  *http.Server
+)
 
 func main() {
 	root := findProjectRoot()
@@ -79,20 +84,56 @@ func main() {
 		wg.Wait()
 		return
 	}
-	go runWebView(apiURL)
-	waitExit(pyCmd)
+
+	keepAPI := os.Getenv("PIGEON_KEEP_API_ON_WEBVIEW_EXIT") == "1"
+	webviewDone := make(chan struct{})
+	var webviewErr error
+	go func() {
+		defer close(webviewDone)
+		webviewErr = runWebView(apiURL)
+	}()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case <-webviewDone:
+		if webviewErr != nil {
+			fmt.Fprintf(os.Stderr, "[pigeon-feige] WebView exit: %v\n", webviewErr)
+		} else {
+			fmt.Fprintf(os.Stderr, "[pigeon-feige] WebView closed, shutting down API\n")
+		}
+		if keepAPI && webviewErr != nil {
+			fmt.Fprintf(os.Stderr, "[pigeon-feige] PIGEON_KEEP_API_ON_WEBVIEW_EXIT=1, API stays up\n")
+			waitExit(pyCmd)
+			wg.Wait()
+			return
+		}
+	case <-sig:
+		fmt.Fprintf(os.Stderr, "[pigeon-feige] signal received, shutting down API\n")
+	}
+
+	shutdown(pyCmd)
+	diagnosePort8765()
 	wg.Wait()
+	os.Exit(0)
 }
 
-func runWebView(url string) {
+func runWebView(url string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Fprintf(os.Stderr, "[pigeon-feige] WebView panic: %v\n", r)
+			err = fmt.Errorf("webview panic: %v", r)
 		}
 	}()
-	if !openWebView(url) {
-		fail("桌面窗口（WebView2）启动失败。API 仍在运行，可访问 http://127.0.0.1:8765")
+	fmt.Fprintf(os.Stderr, "[pigeon-feige] WebView starting\n")
+	if err := openWebView(url); err != nil {
+		fmt.Fprintf(os.Stderr, "[pigeon-feige] WebView start failed: %v\n", err)
+		fail("桌面窗口（WebView2）启动失败。")
+		return err
 	}
+	fmt.Fprintf(os.Stderr, "[pigeon-feige] WebView closed\n")
+	return nil
 }
 
 func startGoAPI(root string) error {
@@ -101,11 +142,13 @@ func startGoAPI(root string) error {
 	if err != nil {
 		return fmt.Errorf("bind :8765: %w", err)
 	}
+	apiListener = ln
 	goAPIServer = api.NewServer(root)
 	goAPIServer.StartBackgroundPrepare()
+	httpServer = &http.Server{Handler: goAPIServer.Handler()}
 	go func() {
 		fmt.Fprintf(os.Stderr, "[pigeon-feige] Go API http://127.0.0.1:8765 (Python bridge worker)\n")
-		if err := http.Serve(ln, goAPIServer.Handler()); err != nil && err != http.ErrServerClosed {
+		if err := httpServer.Serve(apiListener); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintf(os.Stderr, "API server error: %v\n", err)
 		}
 	}()
@@ -113,12 +156,48 @@ func startGoAPI(root string) error {
 }
 
 func shutdown(pyCmd *exec.Cmd) {
+	if httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = httpServer.Shutdown(ctx)
+		cancel()
+		httpServer = nil
+		apiListener = nil
+	} else if apiListener != nil {
+		_ = apiListener.Close()
+		apiListener = nil
+	}
 	if goAPIServer != nil {
-		goAPIServer.Close()
+		srv := goAPIServer
 		goAPIServer = nil
+		done := make(chan struct{})
+		go func() {
+			srv.Close()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			fmt.Fprintf(os.Stderr, "[pigeon-feige] bridge close timeout\n")
+		}
 	}
 	if pyCmd != nil && pyCmd.Process != nil {
 		_ = pyCmd.Process.Kill()
+	}
+}
+
+func diagnosePort8765() {
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	resp, err := client.Get(strings.TrimSuffix(apiURL, "/") + "/api/health")
+	if err != nil {
+		return
+	}
+	resp.Body.Close()
+	fmt.Fprintf(os.Stderr, "[pigeon-feige] WARN: :8765 still accepting after shutdown\n")
+	out, _ := exec.Command("netstat", "-ano").CombinedOutput()
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, ":8765") && strings.Contains(line, "LISTENING") {
+			fmt.Fprintf(os.Stderr, "[pigeon-feige] %s\n", strings.TrimSpace(line))
+		}
 	}
 }
 
@@ -139,7 +218,7 @@ func startPythonAPI(root string) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-func openWebView(url string) bool {
+func openWebView(url string) error {
 	w, err := gowebview.New(&gowebview.Config{
 		URL: url,
 		WindowConfig: &gowebview.WindowConfig{
@@ -151,12 +230,11 @@ func openWebView(url string) bool {
 		},
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "WebView2 启动失败: %v\n", err)
-		return false
+		return fmt.Errorf("webview2: %w", err)
 	}
 	defer w.Destroy()
 	w.Run()
-	return true
+	return nil
 }
 
 func waitExit(cmd *exec.Cmd) {
