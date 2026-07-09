@@ -617,5 +617,9 @@ else {
     }
 }
 
-if ($overallSeverity -eq 'fail') { exit 1 }
+if ($overallSeverity -eq 'fail') {
+    Write-AcceptanceScriptFinal -Label 'stability' -ExitCode 1 | Out-Null
+    exit 1
+}
+Write-AcceptanceScriptFinal -Label 'stability' -ExitCode 0 | Out-Null
 exit 0

@@ -38,6 +38,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/static/", s.handleStatic)
 	mux.HandleFunc("/api/health", s.handleHealth)
+	mux.HandleFunc("/api/bridge/status", s.handleBridgeStatus)
+	mux.HandleFunc("/api/bridge/restart", s.handleBridgeRestart)
 	mux.HandleFunc("/api/session", s.handleSession)
 	mux.HandleFunc("/api/accounts", s.handleAccounts)
 	mux.HandleFunc("/api/accounts/switch", s.handleAccountsSwitch)
@@ -74,14 +76,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/import-cookies", s.handleImportCookies)
 	mux.HandleFunc("/api/session-pack/export", s.handleSessionPackExport)
 	mux.HandleFunc("/api/session-pack/import", s.handleSessionPackImport)
-	return withCORS(mux)
+	return recoverHTTP(withCORS(mux))
 }
 
 func (s *Server) StartBackgroundPrepare() {
+	s.Bridge.StartDaemonBackground()
 	if os.Getenv("PIGEON_ENABLE_STARTUP_WARM") != "1" {
 		return
 	}
-	go warmCSRF(s.Root)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logPanic("warmCSRF", r)
+			}
+		}()
+		warmCSRF(s.Root)
+	}()
 }
 
 func (s *Server) activeAccountID() string {
@@ -198,27 +208,98 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 405, map[string]any{"ok": false})
 		return
 	}
-	out, err := s.Bridge.Call("ping", map[string]any{"oneshot": true})
-	if err != nil {
-		sess, _ := protocol.LoadSession(s.Root)
-		loggedIn := false
-		if sess != nil {
-			loggedIn = sess.LoggedIn()
+	goApiOk := true
+	st := s.Bridge.GetStatus()
+	pythonLive := st.DaemonOK
+	if !pythonLive {
+		pythonLive = s.Bridge.EnsureDaemonWait(2 * time.Second)
+		st = s.Bridge.GetStatus()
+	}
+	bridgeReady := false
+	pingMs := -1
+	if pythonLive {
+		t0 := time.Now()
+		_, err := s.Bridge.Call("ping", nil)
+		pingMs = int(time.Since(t0).Milliseconds())
+		s.Bridge.RecordPingMs(int64(pingMs))
+		bridgeReady = err == nil
+	}
+	if !bridgeReady && pingMs < 0 {
+		t0 := time.Now()
+		_, err := s.Bridge.Call("ping", map[string]any{"oneshot": true})
+		if err == nil {
+			pingMs = int(time.Since(t0).Milliseconds())
 		}
-		writeJSON(w, 200, map[string]any{
-			"ok": loggedIn,
-			"health": map[string]any{
-				"logged_in": loggedIn,
-				"bridge":    err.Error(),
-			},
-			"via": "go/native",
-		})
+	}
+	degraded := !bridgeReady
+	writeJSON(w, 200, map[string]any{
+		"ok":                 goApiOk,
+		"go_api_ok":          goApiOk,
+		"bridge_ready":       bridgeReady,
+		"python_daemon_live": pythonLive && st.PythonPID > 0,
+		"bridge_ping_ms":     pingMs,
+		"degraded":           degraded,
+		"via":                "go/bridge",
+		"health": map[string]any{
+			"bridge_ready":       bridgeReady,
+			"python_daemon_live": pythonLive && st.PythonPID > 0,
+			"restart_count":      st.RestartCount,
+			"last_error":         st.LastError,
+		},
+	})
+}
+
+func (s *Server) handleBridgeStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, 405, map[string]any{"ok": false})
 		return
 	}
+	st := s.Bridge.GetStatus()
+	lastStart := ""
+	if !st.LastStartAt.IsZero() {
+		lastStart = st.LastStartAt.Format(time.RFC3339)
+	}
+	degradedSince := ""
+	if !st.DegradedSince.IsZero() {
+		degradedSince = st.DegradedSince.Format(time.RFC3339)
+	}
 	writeJSON(w, 200, map[string]any{
-		"ok":    true,
-		"health": out,
-		"via":   "go/bridge",
+		"ok":            true,
+		"daemonOK":      st.DaemonOK,
+		"python_pid":    st.PythonPID,
+		"last_start_at": lastStart,
+		"last_error":    st.LastError,
+		"restart_count": st.RestartCount,
+		"last_ping_ms":  st.LastPingMs,
+		"degraded_since": degradedSince,
+	})
+}
+
+func (s *Server) handleBridgeRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"ok": false})
+		return
+	}
+	ok, msg := s.Bridge.RestartDaemon()
+	if !ok {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": msg, "restarted": false})
+		return
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	pingOk := false
+	for time.Now().Before(deadline) {
+		if err := s.Bridge.Ping(); err == nil {
+			pingOk = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	st := s.Bridge.GetStatus()
+	writeJSON(w, 200, map[string]any{
+		"ok":         pingOk,
+		"restarted":  true,
+		"ping_ok":    pingOk,
+		"python_pid": st.PythonPID,
 	})
 }
 
@@ -552,6 +633,24 @@ func degradedOrdersPayload(msg string) map[string]any {
 	}
 }
 
+func degradedOrdersFastPayload(msg string) map[string]any {
+	if msg == "" {
+		msg = "订单加载较慢，可点击重试"
+	}
+	return map[string]any{
+		"ok":        false,
+		"order_ok":  false,
+		"has_order": false,
+		"orders": map[string]any{
+			"has_order": false,
+			"cards":     []any{},
+			"summary":   msg,
+		},
+		"source": "degraded_fast",
+		"error":  msg,
+	}
+}
+
 func bridgeCallWithTimeout(b *bridge.Client, action string, params map[string]any, timeout time.Duration) (map[string]any, error) {
 	type result struct {
 		out map[string]any
@@ -559,6 +658,12 @@ func bridgeCallWithTimeout(b *bridge.Client, action string, params map[string]an
 	}
 	ch := make(chan result, 1)
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logPanic("bridgeCall:"+action, r)
+				ch <- result{err: fmt.Errorf("bridge panic: %v", r)}
+			}
+		}()
 		out, err := b.Call(action, params)
 		ch <- result{out: out, err: err}
 	}()
@@ -576,7 +681,11 @@ func (s *Server) handleContext(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "user_id required"})
 		return
 	}
-	out, err := bridgeCallWithTimeout(s.Bridge, "context", map[string]any{"user_id": uid}, 8*time.Second)
+	if !s.Bridge.EnsureDaemonWait(2 * time.Second) {
+		writeJSON(w, 200, degradedContextPayload("聊天记录暂时不可用"))
+		return
+	}
+	out, err := bridgeCallWithTimeout(s.Bridge, "context", map[string]any{"user_id": uid}, 6*time.Second)
 	s.mu.Lock()
 	aid := s.activeAccountID()
 	if aid != "" && s.unread[aid] != nil {
@@ -614,14 +723,38 @@ func (s *Server) handleOrders(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "user_id required"})
 		return
 	}
-	out, err := bridgeCallWithTimeout(s.Bridge, "orders", map[string]any{"user_id": uid}, 8*time.Second)
+	fast := r.URL.Query().Get("fast") == "1"
+	heavy := r.URL.Query().Get("heavy") == "1"
+	if !heavy && !fast {
+		fast = true
+	}
+	timeout := 3 * time.Second
+	if heavy {
+		timeout = 10 * time.Second
+	}
+	params := map[string]any{"user_id": uid, "fast": fast, "heavy": heavy}
+	if heavy {
+		params["oneshot"] = true
+	} else if !s.Bridge.EnsureDaemonWait(2 * time.Second) {
+		writeJSON(w, 200, degradedOrdersFastPayload("订单加载较慢，可点击重试"))
+		return
+	}
+	out, err := bridgeCallWithTimeout(s.Bridge, "orders", params, timeout)
 	if err != nil {
-		writeJSON(w, 200, degradedOrdersPayload("订单加载失败，可稍后重试"))
+		if fast {
+			writeJSON(w, 200, degradedOrdersFastPayload("订单加载较慢，可点击重试"))
+		} else {
+			writeJSON(w, 200, degradedOrdersPayload("订单加载失败，可稍后重试"))
+		}
 		return
 	}
 	orders, _ := out["orders"].(map[string]any)
 	if orders == nil {
-		writeJSON(w, 200, degradedOrdersPayload("订单加载失败，可稍后重试"))
+		if fast {
+			writeJSON(w, 200, degradedOrdersFastPayload("订单加载较慢，可点击重试"))
+		} else {
+			writeJSON(w, 200, degradedOrdersPayload("订单加载失败，可稍后重试"))
+		}
 		return
 	}
 	if _, ok := orders["cards"]; !ok {

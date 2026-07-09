@@ -99,5 +99,13 @@ switch ($severity) {
     'fail' { Write-Host 'OVERALL: FAIL' -ForegroundColor Red }
     default { Write-Host 'OVERALL: PASS' -ForegroundColor Green }
 }
-if ($severity -eq 'fail') { exit 1 }
+if ($severity -eq 'fail') {
+    Write-AcceptanceScriptFinal -Label 'bridge' -ExitCode 1 | Out-Null
+    exit 1
+}
+if ($severity -eq 'warn') {
+    Write-AcceptanceScriptFinal -Label 'bridge' -ExitCode 1 | Out-Null
+    exit 1
+}
+Write-AcceptanceScriptFinal -Label 'bridge' -ExitCode 0 | Out-Null
 exit 0

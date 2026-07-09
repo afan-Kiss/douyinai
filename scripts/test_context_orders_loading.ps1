@@ -1,9 +1,11 @@
-# Stress / gate test for /api/context and /api/orders - must return within 12s, never HTTP 500.
+# Gate test for /api/context and /api/orders (fast + one heavy round).
 param(
     [string]$Root = (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)),
     [string]$BaseUrl = "http://127.0.0.1:8765",
     [int]$Rounds = 5,
-    [int]$MaxSec = 12
+    [int]$ContextMaxMs = 6000,
+    [int]$OrdersFastMaxMs = 4000,
+    [int]$OrdersHeavyMaxMs = 12200
 )
 
 $ErrorActionPreference = "Continue"
@@ -73,6 +75,7 @@ Write-Host "root: $Root"
 
 Stop-AcceptanceProjectProcesses
 Start-Sleep -Seconds 3
+Remove-Item (Join-Path $Root "logs\runtime\bdms_daemon.lock") -ErrorAction SilentlyContinue
 
 $env:PIGEON_HEADLESS = "1"
 $env:PIGEON_PROJECT_ROOT = $Root
@@ -82,83 +85,73 @@ Start-Process -FilePath (Join-Path $Root "dist\pigeon-feige.exe") -WorkingDirect
 
 if (-not (Wait-AcceptanceApiHealth -BaseUrl $BaseUrl -MaxAttempts 60)) {
     Write-Host "FAIL startup: API not ready" -ForegroundColor Red
+    $ec = Write-AcceptanceScriptFinal -Label 'context_orders' -ExitCode 1
     exit 1
 }
-if (Get-Command Wait-AcceptanceBridgeReady -ErrorAction SilentlyContinue) {
-    if (-not (Wait-AcceptanceBridgeReady -BaseUrl $BaseUrl -MaxAttempts 40)) {
-        Write-Host "WARN bridge not ready - continuing" -ForegroundColor Yellow
-        $warns++
-    }
+if (-not (Wait-AcceptanceBridgeReady -BaseUrl $BaseUrl -MaxAttempts 40)) {
+    Write-Host "FAIL startup: bridge not ready within 20s" -ForegroundColor Red
+    $ec = Write-AcceptanceScriptFinal -Label 'context_orders' -ExitCode 1
+    exit 1
 }
 if (-not (Wait-AcceptanceDaemonReady -MaxAttempts 40)) {
-    Write-Host "WARN python daemon slow - continuing" -ForegroundColor Yellow
-    $warns++
+    Write-Host "FAIL startup: python daemon not ready within 20s" -ForegroundColor Red
+    $ec = Write-AcceptanceScriptFinal -Label 'context_orders' -ExitCode 1
+    exit 1
 }
 Start-Sleep -Seconds 2
 
 $before = Get-AcceptanceProjectCounts
 $failures = 0
-$warns = 0
 
 $convPath = "/api/conversations?category=recent" + "&light=1"
-$conv = Invoke-JsonGet -Path $convPath -TimeoutSec $MaxSec
+$conv = Invoke-JsonGet -Path $convPath -TimeoutSec 8
 $uid = ""
 if ($conv.json -and $conv.json.items -and @($conv.json.items).Count -gt 0) {
     $uid = [string]$conv.json.items[0].security_user_id
 }
 if (-not $uid) {
     $uid = "AQTest0000000000000000000000000000000000000000000000000000000000000001"
-    Write-Host "WARN no conversation uid - using synthetic uid for API shape test" -ForegroundColor Yellow
-    $warns++
+    Write-Host "WARN no conversation uid - using synthetic uid" -ForegroundColor Yellow
 }
 
 for ($i = 1; $i -le $Rounds; $i++) {
-    $ctxRes = Invoke-JsonGet -Path ("/api/context?user_id=" + [uri]::EscapeDataString($uid)) -TimeoutSec $MaxSec
-    $ordRes = Invoke-JsonGet -Path ("/api/orders?user_id=" + [uri]::EscapeDataString($uid)) -TimeoutSec $MaxSec
-
-    foreach ($pair in @(
-            @{ label = "context"; res = $ctxRes }
-            @{ label = "orders"; res = $ordRes }
-        )) {
-        $label = $pair.label
-        $res = $pair.res
-        $lineOk = $true
-        if ($res.code -eq 500) { $lineOk = $false; Write-Host "  FAIL round $i ${label}: HTTP 500" -ForegroundColor Red }
-        if ($res.ms -gt ($MaxSec * 1000)) { $lineOk = $false; Write-Host ("  FAIL round {0} {1}: timeout {2}ms" -f $i, $label, $res.ms) -ForegroundColor Red }
-        if ($res.error) { $lineOk = $false; Write-Host "  FAIL round $i ${label}: $($res.error)" -ForegroundColor Red }
-        if (-not $res.raw) { $lineOk = $false; Write-Host "  FAIL round $i ${label}: empty body" -ForegroundColor Red }
-        else {
-            try {
-                $j = $res.json
-                if (-not $j) { $j = $res.raw | ConvertFrom-Json }
-                if ($label -eq "context") {
-                    if (-not (Test-ContextShape $j)) {
-                        $lineOk = $false
-                        Write-Host "  FAIL round $i context: bad shape" -ForegroundColor Red
-                    }
-                }
-                else {
-                    if (-not (Test-OrdersShape $j)) {
-                        $lineOk = $false
-                        Write-Host "  FAIL round $i orders: bad shape" -ForegroundColor Red
-                    }
-                }
-            }
-            catch {
-                $lineOk = $false
-                Write-Host "  FAIL round $i ${label}: non-JSON" -ForegroundColor Red
-            }
-        }
-        if (-not $lineOk) { $failures++ }
-        else {
-            Write-Host ("  round {0} {1}: code={2} ms={3}" -f $i, $label, $res.code, $res.ms)
-        }
-    }
-
-    if (-not (Test-AcceptanceApiHealth -BaseUrl $BaseUrl)) {
-        Write-Host "  FAIL EXE/API died at round $i" -ForegroundColor Red
+    if (-not (Test-AcceptanceFailFast -BaseUrl $BaseUrl -Hint "round $i")) {
+        Write-Host "  FAIL round ${i}: feige/health fail-fast" -ForegroundColor Red
         $failures++
         break
+    }
+
+    $ctxRes = Invoke-JsonGet -Path ("/api/context?user_id=" + [uri]::EscapeDataString($uid)) -TimeoutSec 8
+    $ordFast = Invoke-JsonGet -Path ("/api/orders?user_id=" + [uri]::EscapeDataString($uid) + "&fast=1") -TimeoutSec 6
+    $ordHeavy = $null
+    if ($i -eq $Rounds) {
+        $ordHeavy = Invoke-JsonGet -Path ("/api/orders?user_id=" + [uri]::EscapeDataString($uid) + "&heavy=1") -TimeoutSec 14
+    }
+
+    $roundOk = $true
+    if ($ctxRes.code -eq 500 -or $ctxRes.error -or -not $ctxRes.raw) { $roundOk = $false }
+    if ($ctxRes.ms -gt $ContextMaxMs) { $roundOk = $false; Write-Host ("  FAIL round {0} context slow: {1}ms" -f $i, $ctxRes.ms) -ForegroundColor Red }
+    if (-not (Test-ContextShape $ctxRes.json)) { $roundOk = $false; Write-Host "  FAIL round $i context: bad shape" -ForegroundColor Red }
+
+    if ($ordFast.code -eq 500 -or $ordFast.error -or -not $ordFast.raw) { $roundOk = $false }
+    if ($ordFast.ms -gt $OrdersFastMaxMs) { $roundOk = $false; Write-Host ("  FAIL round {0} orders_fast slow: {1}ms" -f $i, $ordFast.ms) -ForegroundColor Red }
+    if (-not (Test-OrdersShape $ordFast.json)) { $roundOk = $false; Write-Host "  FAIL round $i orders_fast: bad shape" -ForegroundColor Red }
+
+    $heavyMs = '-'
+    if ($ordHeavy) {
+        $heavyMs = $ordHeavy.ms
+        if ($ordHeavy.code -eq 500 -or $ordHeavy.error -or -not $ordHeavy.raw) { $roundOk = $false }
+        if ($ordHeavy.ms -gt $OrdersHeavyMaxMs) { $roundOk = $false; Write-Host ("  FAIL round {0} orders_heavy slow: {1}ms" -f $i, $ordHeavy.ms) -ForegroundColor Red }
+        if (-not (Test-OrdersShape $ordHeavy.json)) { $roundOk = $false; Write-Host "  FAIL round $i orders_heavy: bad shape" -ForegroundColor Red }
+    }
+
+    $counts = Get-AcceptanceProjectCounts
+    if ($counts.feige -ne 1) { $roundOk = $false; Write-Host "  FAIL round ${i}: feige=$($counts.feige)" -ForegroundColor Red }
+    if ($counts.python -gt ($before.python + 2)) { $roundOk = $false; Write-Host "  FAIL round ${i}: python grew to $($counts.python)" -ForegroundColor Red }
+
+    if (-not $roundOk) { $failures++ }
+    else {
+        Write-Host ("  round {0}: context={1}ms orders_fast={2}ms orders_heavy={3}ms feige={4} py={5} node={6}" -f $i, $ctxRes.ms, $ordFast.ms, $heavyMs, $counts.feige, $counts.python, $counts.node)
     }
     Start-Sleep -Milliseconds 300
 }
@@ -169,16 +162,8 @@ if ($after.python -gt ($before.python + 2)) { $failures++; Write-Host "FAIL pyth
 if ($after.node -gt ($before.node + 2)) { $failures++; Write-Host "FAIL node count grew" -ForegroundColor Red }
 
 Write-Host ("processes: feige={0} python={1} node={2}" -f $after.feige, $after.python, $after.node)
-
 Stop-AcceptanceProjectProcesses
 
-if ($failures -gt 0) {
-    Write-Host "OVERALL: FAIL ($failures issues)" -ForegroundColor Red
-    exit 1
-}
-if ($warns -gt 0) {
-    Write-Host "OVERALL: WARN" -ForegroundColor Yellow
-    exit 0
-}
-Write-Host "OVERALL: PASS" -ForegroundColor Green
-exit 0
+$exitCode = if ($failures -gt 0) { 1 } else { 0 }
+Write-AcceptanceScriptFinal -Label 'context_orders' -ExitCode $exitCode | Out-Null
+exit $exitCode

@@ -1276,15 +1276,19 @@
     }
   }
 
-  async function loadConversationOrders(uid, selectSeq) {
+  async function loadConversationOrders(uid, selectSeq, { heavy = false } = {}) {
     const loadGen = ++_ordersLoadGen;
     state.ordersLoading = true;
     state.ordersError = "";
     renderOrders();
 
-    const ordRes = await api("/api/orders?user_id=" + encodeURIComponent(uid), {
+    const qs = new URLSearchParams({ user_id: uid });
+    if (heavy) qs.set("heavy", "1");
+    else qs.set("fast", "1");
+
+    const ordRes = await api("/api/orders?" + qs.toString(), {
       ...BG_API,
-      timeoutMs: 8000,
+      timeoutMs: heavy ? 10000 : 4000,
     });
 
     if (selectSeq !== _selectReqSeq || uid !== state.currentUid || loadGen !== _ordersLoadGen) {
@@ -1329,7 +1333,7 @@
   function retryCurrentOrders() {
     const uid = state.currentUid;
     if (!uid) return Promise.resolve();
-    return loadConversationOrders(uid, _selectReqSeq);
+    return loadConversationOrders(uid, _selectReqSeq, { heavy: true });
   }
 
   async function selectConversation(uid) {

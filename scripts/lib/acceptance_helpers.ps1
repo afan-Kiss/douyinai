@@ -105,27 +105,129 @@ function Wait-AcceptanceApiHealth {
     return $false
 }
 
+function Get-AcceptanceHealthJson {
+    param(
+        [string]$BaseUrl = 'http://127.0.0.1:8765',
+        [int]$TimeoutSec = 3
+    )
+    try {
+        $resp = Invoke-WebRequest -Uri ($BaseUrl.TrimEnd('/') + '/api/health') -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
+        if ($resp.StatusCode -lt 200 -or $resp.StatusCode -ge 300) { return $null }
+        return ($resp.Content | ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-AcceptanceBridgeReady {
+    param(
+        [string]$BaseUrl = 'http://127.0.0.1:8765'
+    )
+    $h = Get-AcceptanceHealthJson -BaseUrl $BaseUrl
+    if (-not $h) { return $false }
+    if ($h.bridge_ready -eq $true) { return $true }
+    if ($h.go_api_ok -eq $true -and $h.python_daemon_live -eq $true) { return $true }
+    return $false
+}
+
 function Wait-AcceptanceBridgeReady {
     param(
         [string]$BaseUrl = 'http://127.0.0.1:8765',
         [int]$MaxAttempts = 30,
         [int]$SleepMs = 500
     )
-    $url = $BaseUrl.TrimEnd('/') + '/api/health'
     for ($i = 0; $i -lt $MaxAttempts; $i++) {
-        try {
-            $resp = Invoke-WebRequest -Uri $url -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
-            if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 300 -and
-                $resp.Content -match '"via"\s*:\s*"go/bridge"' -and
-                $resp.Content -match '"ok"\s*:\s*true') {
-                return $true
-            }
+        if (Test-AcceptanceBridgeReady -BaseUrl $BaseUrl) {
+            return $true
         }
-        catch {}
         Start-Sleep -Milliseconds $SleepMs
     }
     return $false
 }
+
+function Test-AcceptanceFailFast {
+    param(
+        [string]$BaseUrl = 'http://127.0.0.1:8765',
+        [string]$Hint = ''
+    )
+    if (-not (Test-AcceptanceApiHealth -BaseUrl $BaseUrl)) {
+        Write-AcceptanceRecoveryDiagnostics -Hint ($Hint + ' API health down')
+        return $false
+    }
+    $counts = Get-AcceptanceProjectCounts
+    if ($counts.feige -ne 1) {
+        Write-AcceptanceRecoveryDiagnostics -Hint ($Hint + " feige=$($counts.feige)")
+        return $false
+    }
+    return $true
+}
+
+function Write-AcceptanceScriptFinal {
+    param(
+        [string]$Label,
+        [int]$ExitCode
+    )
+    $val = if ($ExitCode -eq 0) { 0 } else { 1 }
+    Write-Host ''
+    Write-Host 'FINAL:'
+    Write-Host ("  {0}={1}" -f $Label, $val)
+    if ($val -eq 0) {
+        Write-Host 'OVERALL: PASS' -ForegroundColor Green
+    }
+    else {
+        Write-Host 'OVERALL: FAIL' -ForegroundColor Red
+    }
+    return $val
+}
+
+function Write-AcceptanceFullFinal {
+    param(
+        [hashtable]$Results
+    )
+    $fail = $false
+    Write-Host ''
+    Write-Host 'FINAL:'
+    foreach ($key in @('context_orders', 'stability', 'bridge', 'gui_smoke', 'gui_close', 'pure')) {
+        $v = 0
+        if ($Results.ContainsKey($key)) {
+            $v = if ([int]$Results[$key] -eq 0) { 0 } else { 1 }
+        }
+        Write-Host ("  {0}={1}" -f $key, $v)
+        if ($v -ne 0) { $fail = $true }
+    }
+    if ($fail) {
+        Write-Host 'OVERALL: FAIL' -ForegroundColor Red
+        return 1
+    }
+    Write-Host 'OVERALL: PASS' -ForegroundColor Green
+    return 0
+}
+
+function Write-AcceptanceFeigeExitDiagnostics {
+    param(
+        [string]$Root = $script:AcceptanceRoot
+    )
+    Write-Host ''
+    Write-Host '=== Feige exit diagnostics ===' -ForegroundColor Red
+    try {
+        Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error'; StartTime = (Get-Date).AddHours(-1) } -MaxEvents 5 -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host $_.Message }
+    }
+    catch {}
+    $counts = Get-AcceptanceProjectCounts
+    Write-Host ("  feige={0} python={1} node={2}" -f $counts.feige, $counts.python, $counts.node)
+    Write-Host ("  8765 pids: {0}" -f (Get-AcceptancePort8765Pids -join ', '))
+    $logDir = Join-Path $Root 'logs\runtime'
+    if (Test-Path $logDir) {
+        Write-Host '  recent logs/runtime (20):'
+        Get-ChildItem $logDir -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 20 |
+            ForEach-Object { Write-Host ("    {0} ({1})" -f $_.Name, $_.LastWriteTime) }
+    }
+}
+
 
 function Wait-AcceptanceDaemonReady {
     param(

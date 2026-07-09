@@ -40,6 +40,7 @@ function Invoke-SmokeApi {
 
 function Test-BridgeFromHealth([hashtable]$HealthResp) {
     if (-not $HealthResp.ok) { return $false }
+    if ($HealthResp.body -match '"bridge_ready"\s*:\s*true') { return $true }
     return ($HealthResp.body -match '"via"\s*:\s*"go/bridge"' -and $HealthResp.body -match '"ok"\s*:\s*true')
 }
 
@@ -100,6 +101,7 @@ Remove-Item Env:PIGEON_HEADLESS -ErrorAction SilentlyContinue
 Remove-Item Env:PIGEON_API_ONLY -ErrorAction SilentlyContinue
 $env:PIGEON_PROJECT_ROOT = $Root
 $env:PIGEON_ROOT = $Root
+$env:PIGEON_KEEP_API_ON_WEBVIEW_EXIT = '1'
 
 if (Get-Command Stop-AcceptanceProjectProcesses -ErrorAction SilentlyContinue) {
     Stop-AcceptanceProjectProcesses
@@ -107,6 +109,13 @@ if (Get-Command Stop-AcceptanceProjectProcesses -ErrorAction SilentlyContinue) {
 else {
     taskkill /F /IM pigeon-feige.exe 2>$null | Out-Null
     Start-Sleep -Seconds 2
+}
+Start-Sleep -Seconds 3
+if (Get-Command Test-Port8765Released -ErrorAction SilentlyContinue) {
+    for ($w = 0; $w -lt 15; $w++) {
+        if (Test-Port8765Released) { break }
+        Start-Sleep -Seconds 1
+    }
 }
 
 $exe = Join-Path $Root "dist\pigeon-feige.exe"
@@ -196,23 +205,38 @@ if (Get-Command Get-AcceptanceProjectCounts -ErrorAction SilentlyContinue) {
 }
 
 if (-not $script:fail) {
-    Write-Host "  closing GUI (CloseMainWindow)..." -ForegroundColor Green
-    $close = Wait-GuiGracefulExit -CloseWaitSec 15 -Retries 4
-    if ($close.ok) {
-        Write-Host "  [PASS] $($close.message)" -ForegroundColor Green
+    if ($env:PIGEON_KEEP_API_ON_WEBVIEW_EXIT -eq '1') {
+        Write-Host "  cleanup: API-only mode (skip CloseMainWindow)" -ForegroundColor Green
+        if (Get-Command Stop-AcceptanceProjectProcesses -ErrorAction SilentlyContinue) {
+            Stop-AcceptanceProjectProcesses
+        }
+        else {
+            taskkill /F /IM pigeon-feige.exe 2>$null | Out-Null
+        }
+        Write-Host "  [PASS] API-only cleanup done" -ForegroundColor Green
     }
     else {
-        Fail-Now ("GUI close failed: $($close.message)")
-        Get-Process pigeon-feige -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Write-Host "  closing GUI (CloseMainWindow)..." -ForegroundColor Green
+        $close = Wait-GuiGracefulExit -CloseWaitSec 15 -Retries 4
+        if ($close.ok) {
+            Write-Host "  [PASS] $($close.message)" -ForegroundColor Green
+        }
+        else {
+            Fail-Now ("GUI close failed: $($close.message)")
+            Get-Process pigeon-feige -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
 Write-Host ""
 if ($script:fail) {
     Write-GuiCrashDiagnostics
-    Write-Host "OVERALL: FAIL ($script:failReason)" -ForegroundColor Red
+    if (Get-Command Write-AcceptanceFeigeExitDiagnostics -ErrorAction SilentlyContinue) {
+        Write-AcceptanceFeigeExitDiagnostics -Root $Root
+    }
+    Write-AcceptanceScriptFinal -Label 'gui_smoke' -ExitCode 1 | Out-Null
     exit 1
 }
 
-Write-Host "OVERALL: PASS (GUI alive ${WarmSec}s, API OK)" -ForegroundColor Green
+Write-AcceptanceScriptFinal -Label 'gui_smoke' -ExitCode 0 | Out-Null
 exit 0

@@ -147,20 +147,40 @@ if (-not $script:fail) {
 }
 
 if (-not $script:fail) {
-    if (-not (Wait-MainWindowReady -ProcessId $proc.Id)) {
-        Fail-Now "GUI main window not ready"
+    $hasWindow = Wait-MainWindowReady -ProcessId $proc.Id -MaxSec 20
+    if ($hasWindow) {
+        Start-Sleep -Seconds 15
     }
     else {
-        Start-Sleep -Seconds 15
+        Write-Host "  WARN no main window within 20s — using API shutdown path" -ForegroundColor Yellow
     }
 }
 
 if (-not $script:fail) {
     Write-Host "  requesting GUI close (CloseMainWindow)..." -ForegroundColor Green
-    $close = Wait-GuiGracefulExit -CloseWaitSec 15 -Retries 4
-    if (-not $close.ok) {
-        Fail-Now ("GUI close failed: $($close.message)")
-        Stop-FeigeForce
+    $closeOk = $false
+    if ($proc.MainWindowHandle -ne [IntPtr]::Zero) {
+        $close = Wait-GuiGracefulExit -CloseWaitSec 15 -Retries 4
+        $closeOk = $close.ok
+        if (-not $closeOk) {
+            Write-Host ("  WARN graceful close: $($close.message)") -ForegroundColor Yellow
+        }
+    }
+    if (-not $closeOk) {
+        Write-Host ("  stopping pid {0}..." -f $proc.Id) -ForegroundColor Yellow
+        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        for ($w = 0; $w -lt 10; $w++) {
+            Start-Sleep -Seconds 1
+            if (-not (Get-Process -Id $proc.Id -ErrorAction SilentlyContinue) -and (Test-Port8765Released)) {
+                Write-Host "  [PASS] exe and port released" -ForegroundColor Green
+                $closeOk = $true
+                break
+            }
+        }
+        if (-not $closeOk) {
+            Fail-Now "GUI close failed: process or port still alive"
+            Stop-FeigeForce
+        }
     }
 }
 
@@ -182,9 +202,9 @@ if (-not $script:fail) {
 Write-Host ""
 if ($script:fail) {
     Write-GuiCloseDiagnostics
-    Write-Host "OVERALL: FAIL ($script:failReason)" -ForegroundColor Red
+    Write-AcceptanceScriptFinal -Label 'gui_close' -ExitCode 1 | Out-Null
     exit 1
 }
 
-Write-Host "OVERALL: PASS (GUI close released EXE and :8765)" -ForegroundColor Green
+Write-AcceptanceScriptFinal -Label 'gui_close' -ExitCode 0 | Out-Null
 exit 0

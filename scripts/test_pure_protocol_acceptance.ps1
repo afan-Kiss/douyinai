@@ -493,16 +493,16 @@ if ($any.notes -and $any.notes.Count -gt 0) {
 }
 
 switch ($worst) {
-    'PURE_READY' { Write-Host 'OVERALL: PURE_READY' -ForegroundColor Green; exit 0 }
-    'PURE_BETA'  { Write-Host 'OVERALL: PURE_BETA' -ForegroundColor Yellow; exit 0 }
-    default      {
-        $beta = @($results | Where-Object { $_.grade -eq 'PURE_BETA' })
-        if ($beta.Count -gt 0) {
-            Write-Host 'OVERALL: NOT_READY (at least one scenario failed; see PURE_BETA scenario above)' -ForegroundColor Red
-        }
-        else {
-            Write-Host 'OVERALL: NOT_READY' -ForegroundColor Red
-        }
+    'PURE_READY' {
+        Write-AcceptanceScriptFinal -Label 'pure' -ExitCode 0 | Out-Null
+        exit 0
+    }
+    'PURE_BETA' {
+        Write-AcceptanceScriptFinal -Label 'pure' -ExitCode 0 | Out-Null
+        exit 0
+    }
+    default {
+        Write-AcceptanceScriptFinal -Label 'pure' -ExitCode 1 | Out-Null
         exit 1
     }
 }

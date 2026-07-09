@@ -475,8 +475,13 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
         uid = str(params.get("user_id") or "")
         if not uid:
             return _err("user_id required")
+        fast = bool(params.get("fast"))
+        heavy = bool(params.get("heavy"))
         rt = StandaloneRuntime(config=AppConfig(dry_run=False))
-        orders = rt.get_orders(uid)
+        if heavy:
+            orders = rt.get_orders(uid)
+        else:
+            orders = rt.get_orders_fast(uid)
         payload = enrich_order_context(orders)
         from pigeon_protocol.pure_runtime import _orders_ok
 
@@ -484,10 +489,12 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
             StandaloneRuntime._cache_orders(uid, orders)
         ok = bool(orders.has_order or payload.get("cards"))
         err = ""
+        if not ok and getattr(orders, "source", "") == "degraded_fast":
+            err = orders.summary or "订单加载较慢，可点击重试"
         raw = orders.raw if isinstance(getattr(orders, "raw", None), dict) else {}
         data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
         code = str(data.get("code", ""))
-        if code and code not in ("0", "0.0") and not ok:
+        if code and code not in ("0", "0.0") and not ok and not err:
             err = str(data.get("msg") or orders.summary or f"订单查询失败 ({code})")
         resp: dict[str, Any] = {
             "orders": payload,

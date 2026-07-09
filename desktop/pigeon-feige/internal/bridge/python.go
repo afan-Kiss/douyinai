@@ -22,6 +22,7 @@ type Client struct {
 	mu     sync.Mutex
 	startMu sync.Mutex
 	rpcMu  sync.Mutex
+	statusMu sync.RWMutex
 
 	daemon    *exec.Cmd
 	daemonIn  io.WriteCloser
@@ -30,6 +31,11 @@ type Client struct {
 	daemonOK  bool
 
 	lastDaemonRestart time.Time
+	lastStartAt       time.Time
+	lastError         string
+	restartCount      int
+	lastPingMs        int64
+	degradedSince     time.Time
 }
 
 func NewClient(root string) *Client {
@@ -179,10 +185,10 @@ func (c *Client) callDaemonLocked(line string) (map[string]any, error) {
 }
 
 func (c *Client) callDaemonWithTimeoutKillOnTimeout(line string, timeout time.Duration) (map[string]any, error) {
-	return c.callDaemonWithTimeoutKillOnTimeoutInner(line, timeout, false)
+	return c.callDaemonWithTimeoutKillOnTimeoutInner(line, timeout, false, false)
 }
 
-func (c *Client) callDaemonWithTimeoutKillOnTimeoutInner(line string, timeout time.Duration, muAlreadyHeld bool) (map[string]any, error) {
+func (c *Client) callDaemonWithTimeoutKillOnTimeoutInner(line string, timeout time.Duration, muAlreadyHeld bool, killOnTimeout bool) (map[string]any, error) {
 	type result struct {
 		out map[string]any
 		err error
@@ -196,10 +202,12 @@ func (c *Client) callDaemonWithTimeoutKillOnTimeoutInner(line string, timeout ti
 	case res := <-ch:
 		return res.out, res.err
 	case <-time.After(timeout):
-		if muAlreadyHeld {
-			c.resetDaemonLocked()
-		} else {
-			c.resetDaemonSafe()
+		if killOnTimeout {
+			if muAlreadyHeld {
+				c.resetDaemonLocked()
+			} else {
+				c.resetDaemonSafe()
+			}
 		}
 		select {
 		case <-ch:
@@ -210,7 +218,7 @@ func (c *Client) callDaemonWithTimeoutKillOnTimeoutInner(line string, timeout ti
 }
 
 func (c *Client) pingDaemonDuringStart(timeout time.Duration) bool {
-	out, err := c.callDaemonWithTimeoutKillOnTimeoutInner(`{"action":"ping","params":{}}`, timeout, false)
+	out, err := c.callDaemonWithTimeoutKillOnTimeoutInner(`{"action":"ping","params":{}}`, timeout, false, true)
 	if err != nil {
 		return false
 	}
@@ -241,6 +249,7 @@ func (c *Client) startDaemon() bool {
 		return false
 	}
 	if err := cmd.Start(); err != nil {
+		c.noteStartFailure(fmt.Sprintf("cmd.Start: %v", err))
 		return false
 	}
 
@@ -252,6 +261,11 @@ func (c *Client) startDaemon() bool {
 	c.mu.Unlock()
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				c.noteStartFailure(fmt.Sprintf("stderr reader panic: %v", r))
+			}
+		}()
 		sc := bufio.NewScanner(stderr)
 		for sc.Scan() {
 			if os.Getenv("PIGEON_DEV") == "1" {
@@ -264,23 +278,33 @@ func (c *Client) startDaemon() bool {
 	for time.Now().Before(deadline) {
 		c.mu.Lock()
 		dead := c.daemon == nil || c.daemonOut == nil
+		procDead := false
+		if c.daemon != nil && c.daemon.Process != nil {
+			if c.daemon.ProcessState != nil && c.daemon.ProcessState.Exited() {
+				procDead = true
+			}
+		}
 		c.mu.Unlock()
-		if dead {
+		if dead || procDead {
 			c.resetDaemonSafe()
+			c.noteStartFailure("daemon exited during startup")
 			return false
 		}
 		if c.pingDaemonDuringStart(2 * time.Second) {
+			c.noteStartSuccess()
 			return true
 		}
 		c.mu.Lock()
 		dead = c.daemon == nil
 		c.mu.Unlock()
 		if dead {
+			c.noteStartFailure("daemon died before ping")
 			return false
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	c.resetDaemonSafe()
+	c.noteStartFailure("daemon ping timeout after 15s")
 	return false
 }
 
@@ -329,29 +353,69 @@ func (c *Client) callTimeout(action string) time.Duration {
 	}
 }
 
+func (c *Client) callTimeoutFor(action string, params map[string]any) time.Duration {
+	if action == "orders" {
+		if fast, _ := params["fast"].(bool); fast {
+			return 3 * time.Second
+		}
+		if heavy, _ := params["heavy"].(bool); heavy {
+			return 10 * time.Second
+		}
+	}
+	return c.callTimeout(action)
+}
+
+func (c *Client) isDaemonLiveLocked() bool {
+	if !c.daemonOK || c.daemon == nil || c.daemonIn == nil || c.daemonOut == nil {
+		return false
+	}
+	if c.daemon.Process == nil {
+		return false
+	}
+	if c.daemon.ProcessState != nil && c.daemon.ProcessState.Exited() {
+		return false
+	}
+	return true
+}
+
 func (c *Client) ensureDaemon() bool {
-	c.mu.Lock()
-	if c.daemonOK && c.daemon != nil {
+	return c.EnsureDaemonWait(15 * time.Second)
+}
+
+func (c *Client) EnsureDaemonWait(maxWait time.Duration) bool {
+	deadline := time.Now().Add(maxWait)
+	for {
+		c.mu.Lock()
+		live := c.isDaemonLiveLocked()
 		c.mu.Unlock()
-		return true
-	}
-	c.mu.Unlock()
+		if live {
+			return true
+		}
 
-	c.startMu.Lock()
-	defer c.startMu.Unlock()
-
-	c.mu.Lock()
-	if c.daemonOK && c.daemon != nil {
+		c.startMu.Lock()
+		c.mu.Lock()
+		live = c.isDaemonLiveLocked()
+		if live {
+			c.mu.Unlock()
+			c.startMu.Unlock()
+			return true
+		}
 		c.mu.Unlock()
-		return true
-	}
-	c.mu.Unlock()
 
-	ok := c.startDaemon()
-	c.mu.Lock()
-	c.daemonOK = ok
-	c.mu.Unlock()
-	return ok
+		ok := c.startDaemon()
+		c.mu.Lock()
+		c.daemonOK = ok
+		c.mu.Unlock()
+		c.startMu.Unlock()
+
+		if ok {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 func (c *Client) canRestartDaemon() bool {
@@ -378,7 +442,7 @@ func (c *Client) Call(action string, params map[string]any) (map[string]any, err
 	if err != nil {
 		return nil, err
 	}
-	timeout := c.callTimeout(action)
+	timeout := c.callTimeoutFor(action, callParams)
 
 	if forceOneshot {
 		out, err := c.callOneShot(body)
@@ -388,15 +452,20 @@ func (c *Client) Call(action string, params map[string]any) (map[string]any, err
 		return c.normalizeOut(out, action)
 	}
 
-	useDaemon := c.ensureDaemon()
+	waitBudget := 2 * time.Second
+	if action == "prepare_pure" || action == "warm_conv" {
+		waitBudget = 15 * time.Second
+	}
+	useDaemon := c.EnsureDaemonWait(waitBudget)
 	if c.requireDaemon(action) && !useDaemon {
 		return nil, fmt.Errorf("bridge daemon not ready")
 	}
 
 	var out map[string]any
 	if useDaemon {
+		killOnTimeout := c.requireDaemon(action)
 		c.rpcMu.Lock()
-		out, err = c.callDaemonWithTimeoutKillOnTimeout(string(body), timeout)
+		out, err = c.callDaemonWithTimeoutKillOnTimeoutInner(string(body), timeout, false, killOnTimeout)
 		c.rpcMu.Unlock()
 		if err != nil {
 			c.mu.Lock()
@@ -407,7 +476,7 @@ func (c *Client) Call(action string, params map[string]any) (map[string]any, err
 				c.daemonOK = c.startDaemon()
 				if c.daemonOK {
 					c.rpcMu.Lock()
-					out, err = c.callDaemonWithTimeoutKillOnTimeout(string(body), timeout)
+					out, err = c.callDaemonWithTimeoutKillOnTimeoutInner(string(body), timeout, false, true)
 					c.rpcMu.Unlock()
 				}
 			} else if c.requireDaemon(action) {
@@ -495,6 +564,11 @@ func (c *Client) PrepareAsync(timeout time.Duration) {
 	root := c.Root
 	py := c.Python
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[bridge] prepare async panic: %v\n", r)
+			}
+		}()
 		bg := &Client{Root: root, Python: py, daemonOK: false}
 		deadline := time.Now().Add(timeout)
 		for time.Now().Before(deadline) {

@@ -52,6 +52,52 @@ class StandaloneRuntime(PureProtocolRuntime):
             return cached
         return result
 
+    def get_orders_fast(self, security_user_id: str):
+        """Fast path: cache/snapshot/user_card/short relay only — no CDP/HAR/deep fallback."""
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
+
+        from pigeon_protocol.http_transport import order_api_ok
+        from pigeon_protocol.models import OrderContext
+        from pigeon_protocol.offline_order_cache import load_order_cache
+        from pigeon_protocol.order_parse import parse_order_response
+        from pigeon_protocol.order_node_relay import query_orders_via_relay
+        from pigeon_protocol.order_sign_snapshot import query_orders_via_snapshot
+        from pigeon_protocol.pure_runtime import _orders_ok, _user_card_order_hint
+
+        cached = load_order_cache(security_user_id)
+        if cached and (cached.has_order or cached.summary):
+            cached.source = cached.source or "offline_cache"
+            return cached
+
+        snap_raw = query_orders_via_snapshot(self.session, security_user_id)
+        if snap_raw and order_api_ok(snap_raw):
+            parsed = parse_order_response(snap_raw, source=snap_raw.get("via") or "snapshot/curl_cffi")
+            if _orders_ok(parsed):
+                self._cache_orders(security_user_id, parsed)
+                return parsed
+
+        hint = _user_card_order_hint(self.orders.http, security_user_id)
+        if hint:
+            return hint
+
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(query_orders_via_relay, self.session, security_user_id)
+                relay_raw = fut.result(timeout=2.0)
+            if relay_raw and order_api_ok(relay_raw):
+                parsed = parse_order_response(relay_raw, source=relay_raw.get("via") or "python_relay/order/query")
+                if _orders_ok(parsed):
+                    self._cache_orders(security_user_id, parsed)
+                    return parsed
+        except (FutTimeout, TimeoutError, OSError):
+            pass
+
+        return OrderContext(
+            has_order=False,
+            summary="订单加载较慢，可点击重试",
+            source="degraded_fast",
+        )
+
     @staticmethod
     def _cache_orders(security_user_id: str, result) -> None:
         raw = result.raw if isinstance(getattr(result, "raw", None), dict) else {}

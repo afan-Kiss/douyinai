@@ -100,14 +100,20 @@ func main() {
 	case <-webviewDone:
 		if webviewErr != nil {
 			fmt.Fprintf(os.Stderr, "[pigeon-feige] WebView exit: %v\n", webviewErr)
+			if keepAPI {
+				fmt.Fprintf(os.Stderr, "[pigeon-feige] API stays up after WebView error\n")
+				waitExit(pyCmd)
+				wg.Wait()
+				return
+			}
 		} else {
 			fmt.Fprintf(os.Stderr, "[pigeon-feige] WebView closed, shutting down API\n")
-		}
-		if keepAPI && webviewErr != nil {
-			fmt.Fprintf(os.Stderr, "[pigeon-feige] PIGEON_KEEP_API_ON_WEBVIEW_EXIT=1, API stays up\n")
-			waitExit(pyCmd)
-			wg.Wait()
-			return
+			if keepAPI {
+				fmt.Fprintf(os.Stderr, "[pigeon-feige] PIGEON_KEEP_API_ON_WEBVIEW_EXIT=1, API stays up\n")
+				waitExit(pyCmd)
+				wg.Wait()
+				return
+			}
 		}
 	case <-sig:
 		fmt.Fprintf(os.Stderr, "[pigeon-feige] signal received, shutting down API\n")
@@ -147,6 +153,11 @@ func startGoAPI(root string) error {
 	goAPIServer.StartBackgroundPrepare()
 	httpServer = &http.Server{Handler: goAPIServer.Handler()}
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "[pigeon-feige] API server panic: %v\n", r)
+			}
+		}()
 		fmt.Fprintf(os.Stderr, "[pigeon-feige] Go API http://127.0.0.1:8765 (Python bridge worker)\n")
 		if err := httpServer.Serve(apiListener); err != nil && err != http.ErrServerClosed {
 			fmt.Fprintf(os.Stderr, "API server error: %v\n", err)
