@@ -196,15 +196,9 @@ function Invoke-ApiCheck {
             attempts   = $attempt
         }
         try {
-            $raw = curl.exe -sS -m $TimeoutSec -w "`n%{http_code}" $url 2>&1
-            $lines = @($raw -split "`n")
-            if ($lines.Count -lt 2) {
-                $item.error = "empty response"
-                if ($attempt -le $Retries) { continue }
-                return $item
-            }
-            $code = [int]$lines[-1]
-            $body = ($lines[0..($lines.Count - 2)] -join "`n").Trim()
+            $resp = Invoke-WebRequest -Uri $url -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
+            $code = [int]$resp.StatusCode
+            $body = [string]$resp.Content
             $item.status = $code
             $item.elapsed_ms = [int]((Get-Date) - $started).TotalMilliseconds
             if ($code -ge 200 -and $code -lt 300 -and $body) {
@@ -241,16 +235,21 @@ function Invoke-ApiCheck {
                 elseif ($json.logged_in -ne $null) {
                     $item.summary = "logged_in=$($json.logged_in)"
                 }
-                elseif ($json.items) {
+                elseif ($null -ne $json.items) {
                     $item.summary = "items=$($json.items.Count)"
                 }
                 elseif ($json.conversations) {
                     $item.summary = "conversations=$($json.conversations.Count)"
                 }
+                elseif ($json.error) {
+                    $item.summary = "error=$($json.error)"
+                }
                 else {
                     $item.summary = 'json_ok'
                 }
                 $item.severity = Get-ApiLatencySeverity -Label $Label -ElapsedMs $item.elapsed_ms -Ok $item.ok
+                if ($item.ok -or $attempt -gt $Retries) { return $item }
+                if ($json.needs_repair -or $json.error) { continue }
                 return $item
             }
             else {
@@ -475,6 +474,11 @@ if (Get-Command Assert-AcceptanceServiceReady -ErrorAction SilentlyContinue) {
         exit 1
     }
 }
+if (Get-Command Wait-AcceptanceBridgeReady -ErrorAction SilentlyContinue) {
+    if (-not (Wait-AcceptanceBridgeReady -BaseUrl $BaseUrl)) {
+        Write-Host '[WARN] bridge not ready before API baseline; conversations may retry' -ForegroundColor Yellow
+    }
+}
 $rows = Get-ProjectWin32Processes
 $snapshot = Get-ProcessSnapshot -Rows $rows
 $limitChecks = Test-SnapshotLimits -Snap $snapshot -Phase 'baseline'
@@ -483,7 +487,7 @@ $apiChecks = @(
     (Invoke-ApiCheck -Path '/api/session?light=1' -Label 'session' -Retries 1),
     (Invoke-ApiCheck -Path '/api/accounts' -Label 'accounts' -Retries 1),
     (Invoke-ApiCheck -Path '/api/process/status' -Label 'process_status' -Retries 0),
-    (Invoke-ApiCheck -Path '/api/conversations?category=recent&light=1' -Label 'conversations' -Retries 1)
+    (Invoke-ApiCheck -Path '/api/conversations?category=recent&light=1' -Label 'conversations' -Retries 5)
 )
 
 $processStatusJson = $null
@@ -500,6 +504,14 @@ if ($processStatusJson) {
 
 $stress = $null
 if ($RunStress) {
+    if (Get-Command Wait-AcceptanceDaemonReady -ErrorAction SilentlyContinue) {
+        if (-not (Wait-AcceptanceDaemonReady)) {
+            Write-Host '[WARN] python daemon not ready before stress baseline' -ForegroundColor Yellow
+        }
+    }
+    Start-Sleep -Milliseconds 300
+    $rows = Get-ProjectWin32Processes
+    $snapshot = Get-ProcessSnapshot -Rows $rows
     $stress = Invoke-StressSuite -Rounds $StressRounds -Before $snapshot
     $limitChecks += Test-SnapshotLimits -Snap $stress.after -Phase 'after_stress'
     if ($processStatusJson) {

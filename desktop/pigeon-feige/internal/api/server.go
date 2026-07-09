@@ -198,7 +198,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 405, map[string]any{"ok": false})
 		return
 	}
-	out, err := s.Bridge.Call("ping", nil)
+	out, err := s.Bridge.Call("ping", map[string]any{"oneshot": true})
 	if err != nil {
 		sess, _ := protocol.LoadSession(s.Root)
 		loggedIn := false
@@ -240,7 +240,30 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 			resp["qr"] = map[string]any{"phase": "logged_in", "error": "", "running": false}
 		}
 	}
-	out, err := s.Bridge.Call("session_status", nil)
+	if r.URL.Query().Get("light") == "1" {
+		resp["active_account_id"] = protocol.ActiveAccountID(s.Root)
+		if acct, err := s.Bridge.Call("list_accounts", map[string]any{"oneshot": true}); err == nil && acct != nil {
+			if v, ok := acct["accounts"]; ok {
+				resp["accounts"] = v
+			}
+			if v, ok := acct["active_account_id"].(string); ok && v != "" {
+				resp["active_account_id"] = v
+			}
+		}
+		if sess != nil && sess.LoggedIn() {
+			resp["send_ready"] = sess.QueryTokens["pigeon_sign"] != "" && len(sess.WSUrls) > 0
+			resp["listen_ready"] = true
+			resp["session_alive"] = true
+		}
+		if os.Getenv("PIGEON_DEV") == "1" {
+			fmt.Fprintf(os.Stderr, "[api] session light %.0fms\n", float64(time.Since(start).Milliseconds()))
+		}
+		writeJSON(w, 200, resp)
+		return
+	}
+	light := false
+	bridgeParams := map[string]any{"light": light}
+	out, err := s.Bridge.Call("session_status", bridgeParams)
 	if err == nil && out != nil {
 		for k, v := range out {
 			resp[k] = v

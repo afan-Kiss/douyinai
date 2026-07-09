@@ -267,7 +267,8 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
         shop = cookies.get("SHOP_ID") or session.shop_id or ""
         from pigeon_protocol.shop_profile import ensure_shop_name
 
-        shop_name = ensure_shop_name(session, fetch=bool(logged_in))
+        light = bool(params.get("light"))
+        shop_name = ensure_shop_name(session, fetch=bool(logged_in) and not light)
         send_ready = ready.get("send_ready")
         listen_ready = ready.get("listen_ready")
         if job.get("send_ready") is not None:

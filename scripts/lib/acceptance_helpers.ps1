@@ -105,6 +105,43 @@ function Wait-AcceptanceApiHealth {
     return $false
 }
 
+function Wait-AcceptanceBridgeReady {
+    param(
+        [string]$BaseUrl = 'http://127.0.0.1:8765',
+        [int]$MaxAttempts = 30,
+        [int]$SleepMs = 500
+    )
+    $url = $BaseUrl.TrimEnd('/') + '/api/health'
+    for ($i = 0; $i -lt $MaxAttempts; $i++) {
+        try {
+            $resp = Invoke-WebRequest -Uri $url -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
+            if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 300 -and
+                $resp.Content -match '"via"\s*:\s*"go/bridge"' -and
+                $resp.Content -match '"ok"\s*:\s*true') {
+                return $true
+            }
+        }
+        catch {}
+        Start-Sleep -Milliseconds $SleepMs
+    }
+    return $false
+}
+
+function Wait-AcceptanceDaemonReady {
+    param(
+        [int]$MaxAttempts = 30,
+        [int]$SleepMs = 500
+    )
+    for ($i = 0; $i -lt $MaxAttempts; $i++) {
+        $counts = Get-AcceptanceProjectCounts
+        if ($counts.feige -eq 1 -and $counts.python -ge 1) {
+            return $true
+        }
+        Start-Sleep -Milliseconds $SleepMs
+    }
+    return $false
+}
+
 function Write-AcceptanceRecoveryDiagnostics {
     param(
         [string]$Root = $script:AcceptanceRoot,

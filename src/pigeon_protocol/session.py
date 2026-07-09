@@ -77,7 +77,13 @@ def load_session(path: Path | None = None) -> SessionState:
     target = path or _default_session_file()
     if not target.exists():
         return SessionState(notes=["session file missing — run extract-session first"])
-    data = json.loads(target.read_text(encoding="utf-8"))
+    text = target.read_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        if "Extra data" not in str(exc):
+            raise
+        data, _end = json.JSONDecoder().raw_decode(text.lstrip("\ufeff"))
     return SessionState.from_dict(data)
 
 

@@ -20,6 +20,7 @@ type Client struct {
 	Root   string
 	Python string
 	mu     sync.Mutex
+	startMu sync.Mutex
 	rpcMu  sync.Mutex
 
 	daemon    *exec.Cmd
@@ -152,7 +153,7 @@ func (c *Client) CleanupNodesWithOptions(reason string, killAll bool, olderThanS
 
 func (c *Client) requireDaemon(action string) bool {
 	switch action {
-	case "qr_login_start", "qr_login_status", "session_status", "listen_start", "listen_stop", "listen_status", "events":
+	case "qr_login_start", "qr_login_status", "listen_start", "listen_stop", "listen_status", "events":
 		return true
 	default:
 		return false
@@ -209,7 +210,7 @@ func (c *Client) callDaemonWithTimeoutKillOnTimeoutInner(line string, timeout ti
 }
 
 func (c *Client) pingDaemonDuringStart(timeout time.Duration) bool {
-	out, err := c.callDaemonWithTimeoutKillOnTimeoutInner(`{"action":"ping","params":{}}`, timeout, true)
+	out, err := c.callDaemonWithTimeoutKillOnTimeoutInner(`{"action":"ping","params":{}}`, timeout, false)
 	if err != nil {
 		return false
 	}
@@ -242,10 +243,13 @@ func (c *Client) startDaemon() bool {
 	if err := cmd.Start(); err != nil {
 		return false
 	}
+
+	c.mu.Lock()
 	c.daemon = cmd
 	c.daemonIn = stdin
 	c.daemonOut = bufio.NewReader(stdout)
 	c.daemonErr = stderr
+	c.mu.Unlock()
 
 	go func() {
 		sc := bufio.NewScanner(stderr)
@@ -258,19 +262,25 @@ func (c *Client) startDaemon() bool {
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		if c.daemon == nil || c.daemonOut == nil {
-			c.resetDaemonLocked()
+		c.mu.Lock()
+		dead := c.daemon == nil || c.daemonOut == nil
+		c.mu.Unlock()
+		if dead {
+			c.resetDaemonSafe()
 			return false
 		}
 		if c.pingDaemonDuringStart(2 * time.Second) {
 			return true
 		}
-		if c.daemon == nil {
+		c.mu.Lock()
+		dead = c.daemon == nil
+		c.mu.Unlock()
+		if dead {
 			return false
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	c.resetDaemonLocked()
+	c.resetDaemonSafe()
 	return false
 }
 
@@ -300,25 +310,40 @@ func (c *Client) callOneShot(body []byte) (map[string]any, error) {
 
 func (c *Client) callTimeout(action string) time.Duration {
 	switch action {
-	case "ping", "session_status", "qr_login_status", "list_accounts", "listen_status", "health", "process_status":
-		return 3 * time.Second
+	case "ping", "session_status", "list_accounts", "qr_login_status", "listen_status", "health", "process_status":
+		return 5 * time.Second
 	case "qr_login_start":
 		return 8 * time.Second
 	case "prepare_pure", "warm_conv", "session_doctor":
 		return 90 * time.Second
 	default:
-		return 25 * time.Second
+		return 15 * time.Second
 	}
 }
 
 func (c *Client) ensureDaemon() bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.daemonOK && c.daemon != nil {
+		c.mu.Unlock()
 		return true
 	}
-	c.daemonOK = c.startDaemon()
-	return c.daemonOK
+	c.mu.Unlock()
+
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
+
+	c.mu.Lock()
+	if c.daemonOK && c.daemon != nil {
+		c.mu.Unlock()
+		return true
+	}
+	c.mu.Unlock()
+
+	ok := c.startDaemon()
+	c.mu.Lock()
+	c.daemonOK = ok
+	c.mu.Unlock()
+	return ok
 }
 
 func (c *Client) canRestartDaemon() bool {
@@ -329,12 +354,31 @@ func (c *Client) canRestartDaemon() bool {
 }
 
 func (c *Client) Call(action string, params map[string]any) (map[string]any, error) {
-	req := map[string]any{"action": action, "params": params}
+	if params == nil {
+		params = map[string]any{}
+	}
+	forceOneshot, _ := params["oneshot"].(bool)
+	callParams := map[string]any{}
+	for k, v := range params {
+		if k == "oneshot" {
+			continue
+		}
+		callParams[k] = v
+	}
+	req := map[string]any{"action": action, "params": callParams}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
 	timeout := c.callTimeout(action)
+
+	if forceOneshot {
+		out, err := c.callOneShot(body)
+		if err != nil {
+			return nil, err
+		}
+		return c.normalizeOut(out, action)
+	}
 
 	useDaemon := c.ensureDaemon()
 	if c.requireDaemon(action) && !useDaemon {

@@ -79,14 +79,20 @@ func main() {
 		wg.Wait()
 		return
 	}
-	if !openWebView(apiURL) {
-		fail("桌面窗口（WebView2）启动失败。请安装 Microsoft Edge WebView2 运行时后重试。")
-		shutdown(pyCmd)
-		os.Exit(1)
-	}
-
+	go runWebView(apiURL)
 	waitExit(pyCmd)
 	wg.Wait()
+}
+
+func runWebView(url string) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "[pigeon-feige] WebView panic: %v\n", r)
+		}
+	}()
+	if !openWebView(url) {
+		fail("桌面窗口（WebView2）启动失败。API 仍在运行，可访问 http://127.0.0.1:8765")
+	}
 }
 
 func startGoAPI(root string) error {
