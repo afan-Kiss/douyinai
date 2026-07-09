@@ -62,6 +62,13 @@ HIGH_PRIORITY_KEYS = (
     "remarkName",
     "avatar_name",
     "avatarName",
+    "show_name",
+    "showName",
+    "real_name",
+    "realName",
+    "uname",
+    "cname",
+    "remark",
 )
 
 MEDIUM_PRIORITY_KEYS = ("name",)
@@ -105,8 +112,13 @@ def extract_buyer_name_from_obj(obj: Any) -> str:
                         walk(val)
                     continue
                 pri = _key_priority(k)
-                if pri is not None and isinstance(val, str):
-                    text = val.strip()
+                if pri is not None:
+                    if isinstance(val, str):
+                        text = val.strip()
+                    elif isinstance(val, (int, float)) and not isinstance(val, bool):
+                        text = str(val).strip()
+                    else:
+                        text = ""
                     if text and not is_bad_display_name(text):
                         candidates.append((pri, text))
                 elif isinstance(val, (dict, list)):
@@ -214,6 +226,103 @@ def extract_conversation_display_name(
         return nested, "nested"
 
     return "", ""
+
+
+def resolve_item_display_name(item: dict[str, Any]) -> tuple[str, str]:
+    uid = str(item.get("security_user_id") or item.get("security_uid") or "")
+
+    card = item.get("card")
+    if isinstance(card, dict):
+        nested = extract_buyer_name_from_obj(card)
+        if nested:
+            return nested, "card"
+
+    last_msg = item.get("last_history_msg") if isinstance(item.get("last_history_msg"), dict) else {}
+    msg_body = last_msg.get("message_body") if isinstance(last_msg.get("message_body"), dict) else {}
+    ext = msg_body.get("ext") if isinstance(msg_body.get("ext"), dict) else {}
+    if not ext and isinstance(item.get("ext"), dict):
+        ext = item["ext"]
+
+    name, src = extract_conversation_display_name(item, msg_body, ext)
+    if name:
+        return name, src
+
+    for key in ("display_name", "buyer_name", "name", "nickname", "nick_name", "user_name"):
+        val = item.get(key)
+        if val is None:
+            continue
+        text = str(val).strip()
+        if text and not is_bad_display_name(text):
+            return text, f"item.{key}"
+
+    if uid:
+        return buyer_label_from_uid(uid), "uid_tail"
+    return "未知买家", "unknown"
+
+
+def normalize_conversation_item(item: dict[str, Any]) -> dict[str, Any]:
+    out = dict(item)
+    uid = str(out.get("security_user_id") or out.get("security_uid") or "")
+    name, name_source = resolve_item_display_name(out)
+    if is_bad_display_name(name):
+        name = buyer_label_from_uid(uid) if uid else "未知买家"
+        name_source = "uid_tail"
+    out["name"] = name
+    out["buyer_name"] = name
+    out["display_name"] = name
+    out["name_source"] = name_source or str(out.get("name_source") or "")
+    preview = sanitize_conv_preview(str(out.get("preview") or ""))
+    if preview:
+        out["preview"] = preview[:120]
+    return out
+
+
+def normalize_conversation_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [normalize_conversation_item(it) for it in items if isinstance(it, dict)]
+
+
+def enrich_items_with_user_card(
+    session,
+    items: list[dict[str, Any]],
+    *,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    from pigeon_protocol.conv_list_fallback import _user_card_hint
+
+    out: list[dict[str, Any]] = []
+    enriched = 0
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        uid = str(item.get("security_user_id") or item.get("security_uid") or "")
+        current = str(item.get("display_name") or item.get("buyer_name") or item.get("name") or "")
+        uid_label = buyer_label_from_uid(uid) if uid else ""
+        needs_card = (
+            bool(uid)
+            and enriched < limit
+            and (
+                not current
+                or is_bad_display_name(current)
+                or current == uid_label
+                or current.replace(" ", "") == uid_label
+            )
+        )
+        if needs_card:
+            hint = _user_card_hint(session, uid)
+            card_name = str(hint.get("name") or "").strip()
+            if card_name and not is_bad_display_name(card_name):
+                item["name"] = card_name
+                item["buyer_name"] = card_name
+                item["display_name"] = card_name
+                item["name_source"] = "user_card"
+                if hint.get("buyer_source"):
+                    item["buyer_source"] = str(hint.get("buyer_source") or "")
+                if isinstance(hint.get("card"), dict):
+                    item["card"] = hint["card"]
+                enriched += 1
+        out.append(normalize_conversation_item(item))
+    return out
 
 
 def sanitize_conv_preview(preview: str) -> str:

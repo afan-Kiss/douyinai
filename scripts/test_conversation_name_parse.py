@@ -10,9 +10,11 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from pigeon_protocol.buyer_display_name import (
     buyer_label_from_uid,
+    enrich_items_with_user_card,
     extract_buyer_name_from_obj,
     extract_conversation_display_name,
     is_bad_display_name,
+    normalize_conversation_item,
     sanitize_conv_preview,
 )
 from pigeon_protocol.conv_list import parse_conversation_items
@@ -100,6 +102,63 @@ def test_parse_items_fields() -> None:
     _assert(items[0]["name"] != "其他", items[0]["name"])
 
 
+def test_normalize_cached_bad_name() -> None:
+    uid = "AQCnSRsg6VjCVV6CzwN4oOAcHF9PP0l8Wt61aPf6eWv91CiWTitMouMi93A9JW_hl54iRJnOiiFe7Sfrh83xb6Nk"
+    item = {
+        "security_user_id": uid,
+        "name": "其他",
+        "display_name": "其他",
+        "buyer_name": "其他",
+        "preview": "已知买家（xundan 11001 fallback）",
+        "buyer_source": "其他",
+    }
+    out = normalize_conversation_item(item)
+    _assert(out["name"] == buyer_label_from_uid(uid), out["name"])
+    _assert(out["name"] != "其他", out["name"])
+    _assert(out["preview"] == "已知买家", out["preview"])
+
+
+def test_normalize_nested_card_name() -> None:
+    uid = "AQCnSRsg6VjCVV6CzwN4oOAcHF9PP0l8Wt61aPf6eWv91CiWTitMouMi93A9JW_hl54iRJnOiiFe7Sfrh83xb6Nk"
+    item = {
+        "security_user_id": uid,
+        "name": "站内push推送",
+        "card": {
+            "user_from_desc": "其他",
+            "user_info": {"nick_name": "珠宝客户A"},
+        },
+    }
+    out = normalize_conversation_item(item)
+    _assert(out["name"] == "珠宝客户A", out["name"])
+
+
+def test_enrich_user_card(monkeypatch=None) -> None:
+    uid = "AQCnSRsg6VjCVV6CzwN4oOAcHF9PP0l8Wt61aPf6eWv91CiWTitMouMi93A9JW_hl54iRJnOiiFe7Sfrh83xb6Nk"
+    items = [{"security_user_id": uid, "name": "其他", "display_name": "其他"}]
+
+    class _Session:
+        pass
+
+    def _fake_hint(_session, _uid: str) -> dict:
+        return {
+            "name": "小王",
+            "buyer_source": "其他",
+            "preview": "成交3单",
+            "card": {"user_info": {"nick_name": "小王"}},
+        }
+
+    import pigeon_protocol.conv_list_fallback as fb
+
+    old = fb._user_card_hint
+    fb._user_card_hint = _fake_hint
+    try:
+        out = enrich_items_with_user_card(_Session(), items)
+        _assert(out[0]["name"] == "小王", out[0]["name"])
+        _assert(out[0]["name_source"] in ("user_card", "card"), out[0]["name_source"])
+    finally:
+        fb._user_card_hint = old
+
+
 def test_preview_sanitize() -> None:
     p = sanitize_conv_preview("已知买家（xundan 11001 fallback）")
     _assert(p == "已知买家", p)
@@ -113,6 +172,9 @@ def main() -> int:
         test_xundan_title_vs_nickname,
         test_xundan_title_other_fallback,
         test_parse_items_fields,
+        test_normalize_cached_bad_name,
+        test_normalize_nested_card_name,
+        test_enrich_user_card,
         test_preview_sanitize,
     ]
     failed = 0

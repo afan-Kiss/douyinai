@@ -62,7 +62,7 @@ def _disk_cache_path() -> Path:
 
 
 def _load_disk_caches_once() -> None:
-    global _DISK_CACHE_LOADED
+    global _DISK_CACHE_LOADED, _DISK_CACHE_ACCOUNT
     if _DISK_CACHE_LOADED:
         return
     _DISK_CACHE_LOADED = True
@@ -88,8 +88,12 @@ def _load_disk_caches_once() -> None:
             except ValueError:
                 continue
             _CONV_CACHE[key] = dict(payload)
-    _DISK_CACHE_LOADED = True
-    _DISK_CACHE_ACCOUNT = aid
+    try:
+        from pigeon_protocol.account_context import active_account_id
+
+        _DISK_CACHE_ACCOUNT = active_account_id()
+    except Exception:
+        _DISK_CACHE_ACCOUNT = ""
 
 
 def _disk_cache_key(key: tuple[str, str, int, int]) -> str:
@@ -157,6 +161,20 @@ def _conv_ok(raw: dict[str, Any], items: list[dict[str, Any]]) -> bool:
     return str(code) in ("0", "200") or bool(items) or bool(raw.get("ok"))
 
 
+def _finalize_conversation_items(
+    items: list[dict[str, Any]],
+    *,
+    session=None,
+    enrich_user_card: bool = True,
+) -> list[dict[str, Any]]:
+    from pigeon_protocol.buyer_display_name import enrich_items_with_user_card, normalize_conversation_items
+
+    normalized = normalize_conversation_items(items)
+    if enrich_user_card and session is not None and normalized:
+        return enrich_items_with_user_card(session, normalized)
+    return normalized
+
+
 def _light_response(
     *,
     ok: bool,
@@ -199,9 +217,10 @@ def _fetch_conversations_light(
 
     fresh = _cache_get(cache_key, allow_stale=False)
     if fresh and fresh.get("items"):
+        items = _finalize_conversation_items(list(fresh["items"]), session=session)
         return _light_response(
             ok=True,
-            items=list(fresh["items"]),
+            items=items,
             raw=fresh.get("raw") if isinstance(fresh.get("raw"), dict) else {},
             source="cache_fresh",
         )
@@ -214,7 +233,7 @@ def _fetch_conversations_light(
         skip_warm=True,
         snapshot_only=True,
     )
-    snap_items = parse_conversation_items(snap_raw)
+    snap_items = _finalize_conversation_items(parse_conversation_items(snap_raw), session=session)
     if snap_items:
         payload = _cache_payload(items=snap_items, raw=snap_raw, source="snapshot")
         _cache_set(cache_key, payload)
@@ -224,7 +243,7 @@ def _fetch_conversations_light(
         from pigeon_protocol.conv_list_fallback import list_conversations_fallback
 
         local_raw = list_conversations_fallback(session, limit=size)
-        local_items = parse_conversation_items(local_raw)
+        local_items = _finalize_conversation_items(parse_conversation_items(local_raw), session=session)
         if local_items:
             payload = _cache_payload(items=local_items, raw=local_raw, source="local_snapshot")
             _cache_set(cache_key, payload)
@@ -243,7 +262,7 @@ def _fetch_conversations_light(
             skip_warm=True,
             request_timeout_sec=2.5,
         )
-        live_items = parse_conversation_items(live_raw)
+        live_items = _finalize_conversation_items(parse_conversation_items(live_raw), session=session)
     except Exception as exc:
         live_raw = {"ok": False, "error": str(exc)}
 
@@ -254,9 +273,10 @@ def _fetch_conversations_light(
 
     stale = _cache_get(cache_key, allow_stale=True)
     if stale and stale.get("items"):
+        items = _finalize_conversation_items(list(stale["items"]), session=session)
         return _light_response(
             ok=True,
-            items=list(stale["items"]),
+            items=items,
             raw=stale.get("raw") if isinstance(stale.get("raw"), dict) else {},
             source="cache_stale",
             warning="会话刷新慢，已显示上次列表",
@@ -291,7 +311,7 @@ def fetch_conversations(*, page: int = 0, size: int = 30, category: str = "", li
         queue_keys=queue_keys,
     )
     code = raw.get("code") or raw.get("st")
-    items = parse_conversation_items(raw)
+    items = _finalize_conversation_items(parse_conversation_items(raw), session=session)
     ok = str(code) in ("0", "200") or bool(items) or bool(raw.get("ok"))
 
     if ok and not items:
@@ -299,7 +319,7 @@ def fetch_conversations(*, page: int = 0, size: int = 30, category: str = "", li
             from pigeon_protocol.conv_list_fallback import list_conversations_fallback
 
             fb = list_conversations_fallback(session, limit=size)
-            fb_items = parse_conversation_items(fb)
+            fb_items = _finalize_conversation_items(parse_conversation_items(fb), session=session)
             if fb_items:
                 raw = fb
                 items = fb_items
@@ -316,7 +336,7 @@ def fetch_conversations(*, page: int = 0, size: int = 30, category: str = "", li
             queue_keys=XUNDAN_QUEUE_KEYS,
         )
         code = raw.get("code") or raw.get("st")
-        items = parse_conversation_items(raw)
+        items = _finalize_conversation_items(parse_conversation_items(raw), session=session)
         ok = str(code) in ("0", "200") or bool(items) or bool(raw.get("ok"))
 
     if not ok and not items:
@@ -330,7 +350,7 @@ def fetch_conversations(*, page: int = 0, size: int = 30, category: str = "", li
             queue_keys=queue_keys,
         )
         code = raw.get("code") or raw.get("st")
-        items = parse_conversation_items(raw)
+        items = _finalize_conversation_items(parse_conversation_items(raw), session=session)
         ok = str(code) in ("0", "200") or bool(items) or bool(raw.get("ok"))
 
     if not ok and not items:
@@ -340,7 +360,7 @@ def fetch_conversations(*, page: int = 0, size: int = 30, category: str = "", li
 
             rt = StandaloneRuntime(config=AppConfig(dry_run=False))
             fallback = rt.context.list_conversations(page=page, size=size)
-            items = parse_conversation_items(fallback)
+            items = _finalize_conversation_items(parse_conversation_items(fallback), session=session)
             raw = fallback if isinstance(fallback, dict) else {"data": fallback}
             if isinstance(raw, dict):
                 raw["via"] = str(raw.get("via") or "fallback/fuzzySearchConversation")

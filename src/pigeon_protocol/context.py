@@ -27,11 +27,13 @@ class ContextService:
 
             ctx = fetch_context_pure(self.session, security_user_id, shop_id=self.session.shop_id)
             if ctx.messages or not via_pigeon_im:
+        from pigeon_protocol.buyer_display_name import extract_buyer_name_from_obj, is_bad_display_name
+
                 card = self.http.get_user_card(security_user_id)
                 data = card.get("data") if isinstance(card.get("data"), dict) else {}
                 inner = data.get("data") if isinstance(data.get("data"), dict) else data
-                name = str(inner.get("user_name") or inner.get("nick_name") or inner.get("name") or "")
-                if name:
+                name = extract_buyer_name_from_obj(inner if isinstance(inner, dict) else {})
+                if name and not is_bad_display_name(name):
                     ctx.buyer_name = name
                 return ctx
 
