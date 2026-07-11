@@ -536,6 +536,8 @@ def parse_conversation_items(raw: dict[str, Any]) -> list[dict[str, Any]]:
             or (it.get("user_info") or {}).get("security_user_id")
             or ""
         )
+        if uid.startswith("AQTest"):
+            continue
         last_msg = it.get("last_history_msg") if isinstance(it.get("last_history_msg"), dict) else {}
         msg_body = last_msg.get("message_body") if isinstance(last_msg.get("message_body"), dict) else {}
         ext = msg_body.get("ext") if isinstance(msg_body.get("ext"), dict) else {}

@@ -504,7 +504,12 @@ def _post_login_bootstrap_background(
 
     if qr_state is not None and qr_client is not None:
         try:
-            qr_client.apply_to_session(session, qr_state)
+            from pigeon_protocol.qr_login import QR_CONFIRMED
+
+            if str(getattr(qr_state, "status", "") or "") == QR_CONFIRMED:
+                qr_state.cookies = qr_client.complete_fxg_login(qr_state)
+                qr_state.cookies.update(qr_client.open_feige_workspace())
+            qr_client.apply_to_session(session, qr_state, replace_auth=False)
             report["steps"].append("apply_session")
         except Exception as exc:
             report["apply_error"] = str(exc)[:200]
@@ -541,6 +546,13 @@ def _post_login_bootstrap_background(
         save_session(session)
     except OSError as exc:
         report["save_error"] = str(exc)[:120]
+
+    try:
+        from pigeon_protocol.shop_profile import sync_session_shop_identity
+
+        report["account_id"] = sync_session_shop_identity(session, set_active=True)
+    except Exception as exc:
+        report["account_register_error"] = str(exc)[:120]
     return report
 
 
@@ -758,9 +770,9 @@ def post_login_bootstrap(
         report["save_error"] = str(exc)[:120]
 
     try:
-        from pigeon_protocol.account_context import register_account_from_session
+        from pigeon_protocol.shop_profile import sync_session_shop_identity
 
-        report["account_id"] = register_account_from_session(session, set_active=True)
+        report["account_id"] = sync_session_shop_identity(session, set_active=True)
     except Exception as exc:
         report["account_register_error"] = str(exc)[:120]
 

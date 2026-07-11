@@ -11,18 +11,17 @@ type registryDoc struct {
 }
 
 func ActiveAccountID(root string) string {
+	data, err := os.ReadFile(filepath.Join(root, "accounts", "registry.json"))
+	if err == nil {
+		var doc registryDoc
+		if json.Unmarshal(data, &doc) == nil && doc.ActiveAccountID != "" {
+			return doc.ActiveAccountID
+		}
+	}
 	if v := os.Getenv("PIGEON_ACCOUNT_ID"); v != "" {
 		return v
 	}
-	data, err := os.ReadFile(filepath.Join(root, "accounts", "registry.json"))
-	if err != nil {
-		return ""
-	}
-	var doc registryDoc
-	if json.Unmarshal(data, &doc) != nil {
-		return ""
-	}
-	return doc.ActiveAccountID
+	return ""
 }
 
 func SessionFilePath(root string) string {

@@ -148,6 +148,13 @@ class PureProtocolRuntime:
     def _on_ws_message(self, handler: Callable[[InboundMessage], None] | None = None):
         def _wrap(msg: InboundMessage) -> None:
             self.store.add(msg)
+            uid = str(msg.security_user_id or "").strip()
+            nick = str(msg.nickname or "").strip()
+            if uid and nick:
+                from pigeon_protocol.buyer_display_name import is_bad_display_name, remember_buyer_display_name
+
+                if not is_bad_display_name(nick, uid=uid):
+                    remember_buyer_display_name(self.session, uid, nick, save=True)
             if handler:
                 handler(msg)
 

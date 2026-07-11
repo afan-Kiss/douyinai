@@ -66,6 +66,7 @@ _LEGACY_IMPORT_MAP = {
 }
 
 _initialized = False
+_reconciling = False
 
 
 def _now() -> int:
@@ -127,11 +128,14 @@ def account_home(account_id: str | None = None) -> Path:
 
 
 def active_account_id() -> str:
+    doc = load_registry()
+    reg = str(doc.get("active_account_id") or "").strip()
+    if reg:
+        return reg
     env = os.getenv("PIGEON_ACCOUNT_ID", "").strip()
     if env:
         return env
-    doc = load_registry()
-    return str(doc.get("active_account_id") or "").strip()
+    return ""
 
 
 def session_dir() -> Path:
@@ -300,6 +304,48 @@ def dedupe_account_rows(rows: list[dict[str, Any]], *, active_id: str = "") -> l
     return merged
 
 
+def enrich_accounts_with_session_shop(
+    accounts: list[dict[str, Any]],
+    *,
+    active_id: str,
+    shop_name: str,
+    shop_id: str = "",
+) -> list[dict[str, Any]]:
+    """Patch active logged-in row with resolved shop_name for account picker."""
+    from pigeon_protocol.shop_profile import is_placeholder_shop_label
+
+    name = str(shop_name or "").strip()
+    sid = str(shop_id or "").strip()
+    if not name or is_placeholder_shop_label(name, sid):
+        return accounts
+    active = str(active_id or "").strip()
+    if not active:
+        return accounts
+    out: list[dict[str, Any]] = []
+    for row in accounts:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        if str(item.get("id") or "") != active or not item.get("logged_in"):
+            out.append(item)
+            continue
+        item["shop_name"] = name
+        was_empty_slot = bool(item.get("is_empty_slot"))
+        item["is_empty_slot"] = False
+        if sid and not str(item.get("shop_id") or "").strip():
+            item["shop_id"] = sid
+        label = str(item.get("label") or "").strip()
+        if (
+            not label
+            or was_empty_slot
+            or label in {"扫码登录新店铺", "空账号槽", "新账号"}
+            or is_placeholder_shop_label(label, sid or str(item.get("shop_id") or ""))
+        ):
+            item["label"] = name
+        out.append(item)
+    return out
+
+
 def _copy_account_session_tree(src_home: Path, dest_home: Path) -> None:
     dest_home.mkdir(parents=True, exist_ok=True)
     (dest_home / "bundle").mkdir(parents=True, exist_ok=True)
@@ -404,20 +450,119 @@ def consolidate_registry_duplicates() -> dict[str, Any]:
     return {"removed": removed, "count": len(removed)}
 
 
+def reconcile_accounts_from_disk() -> dict[str, Any]:
+    """Register logged-in account folders missing from registry; revive logged-out shops with valid session."""
+    global _reconciling
+    if _reconciling:
+        return {"skipped": True}
+    _reconciling = True
+    try:
+        return _reconcile_accounts_from_disk_impl()
+    finally:
+        _reconciling = False
+
+
+def _reconcile_accounts_from_disk_impl() -> dict[str, Any]:
+    ACCOUNTS_ROOT.mkdir(parents=True, exist_ok=True)
+    doc = load_registry()
+    report: dict[str, Any] = {"registered": [], "promoted": [], "reactivated": []}
+    candidates: list[tuple[str, Path, int]] = []
+
+    for child in ACCOUNTS_ROOT.iterdir():
+        if not child.is_dir():
+            continue
+        aid = child.name
+        if aid.startswith("."):
+            continue
+        if not (child / "session.json").is_file():
+            continue
+        if not account_logged_in(aid):
+            continue
+        try:
+            mtime = int(child.stat().st_mtime)
+        except OSError:
+            mtime = 0
+        candidates.append((aid, child, mtime))
+
+    candidates.sort(key=lambda item: (0 if item[0].startswith("shop_") else 1, -item[2]))
+    known_ids = {str(row.get("id") or "") for row in (doc.get("accounts") or []) if isinstance(row, dict)}
+
+    for aid, home, _mtime in candidates:
+        sess_dict = _read_json(home / "session.json") or {}
+        cookies = dict(sess_dict.get("cookies") or {})
+        shop = str(sess_dict.get("shop_id") or cookies.get("SHOP_ID") or "").strip()
+        canonical = aid
+        if shop and aid != derive_account_id(shop_id=shop):
+            try:
+                canonical = promote_account_to_shop(aid, shop)
+                if canonical != aid:
+                    report["promoted"].append(f"{aid}->{canonical}")
+                doc = load_registry()
+                known_ids = {str(row.get("id") or "") for row in (doc.get("accounts") or []) if isinstance(row, dict)}
+                aid = canonical
+            except Exception as exc:
+                logger.debug("reconcile promote %s: %s", aid, exc)
+
+        row = _account_entry(doc, aid)
+        if row and int(row.get("logged_out_at") or 0):
+            row.pop("logged_out_at", None)
+            row["updated_at"] = _now()
+            if shop:
+                row["shop_id"] = shop
+            save_registry(doc)
+            report["reactivated"].append(aid)
+            doc = load_registry()
+        elif aid not in known_ids:
+            from pigeon_protocol.shop_profile import load_stored_shop_profile
+
+            profile = load_stored_shop_profile(account_id=aid, shop_id=shop)
+            label = str(profile.get("shop_name") or "").strip() or aid
+            reg_shop = shop or str(profile.get("shop_id") or "").strip()
+            register_account(aid, label=label, shop_id=reg_shop, set_active=False)
+            report["registered"].append(aid)
+            doc = load_registry()
+            known_ids.add(aid)
+
+    active = str(doc.get("active_account_id") or "").strip()
+    if active and not account_logged_in(active):
+        fallback = next((caid for caid, _home, _ in candidates if account_logged_in(caid)), "")
+        if fallback and fallback != active:
+            doc["active_account_id"] = fallback
+            save_registry(doc)
+            apply_account_env(fallback)
+            report["active_switched"] = f"{active}->{fallback}"
+
+    return report
+
+
 def _build_account_row(row: dict[str, Any], *, active: str) -> dict[str, Any]:
-    from pigeon_protocol.shop_profile import display_shop_name, is_placeholder_shop_label, shop_name_from_mapping
+    from pigeon_protocol.shop_profile import (
+        display_shop_name,
+        infer_shop_id_from_session,
+        is_placeholder_shop_label,
+        load_stored_shop_profile,
+        shop_name_from_mapping,
+    )
+    from pigeon_protocol.session import SessionState
 
     aid = str(row.get("id") or "")
     home = account_home(aid)
     sess = _read_json(home / "session.json") or {}
     cookies = dict(sess.get("cookies") or {})
     logged_in = bool(cookies.get("sessionid") or cookies.get("sid_tt"))
-    shop = str(row.get("shop_id") or cookies.get("SHOP_ID") or sess.get("shop_id") or "")
+    shop = str(row.get("shop_id") or cookies.get("SHOP_ID") or cookies.get("ecom_gray_shop_id") or sess.get("shop_id") or "")
+    if not shop and sess:
+        try:
+            shop = infer_shop_id_from_session(SessionState.from_dict(sess))
+        except Exception:
+            shop = ""
     label = str(row.get("label") or "")
     logged_out_at = int(row.get("logged_out_at") or 0)
     if logged_out_at:
         logged_in = False
     shop_name = shop_name_from_mapping(row, shop_id=shop) or shop_name_from_mapping(sess, shop_id=shop)
+    if not shop_name and shop:
+        shop_name = str(load_stored_shop_profile(account_id=aid, shop_id=shop).get("shop_name") or "")
     if shop_name:
         display = shop_name
     elif label and not is_placeholder_shop_label(label, shop):
@@ -493,8 +638,10 @@ def register_account(
 
 
 def register_account_from_session(session, *, set_active: bool = False, source_account_id: str = "") -> str:
+    from pigeon_protocol.shop_profile import infer_shop_id_from_session
+
     cookies = getattr(session, "cookies", None) or {}
-    shop = str(getattr(session, "shop_id", "") or cookies.get("SHOP_ID") or "")
+    shop = infer_shop_id_from_session(session) or str(getattr(session, "shop_id", "") or cookies.get("SHOP_ID") or "")
     sid = str(cookies.get("sessionid") or cookies.get("sid_tt") or "")
     src = str(source_account_id or active_account_id() or "").strip()
     if shop and src and src != derive_account_id(shop_id=shop):
@@ -781,6 +928,14 @@ def init_account_context(*, migrate: bool = True) -> dict[str, Any]:
         report["migration"] = _migrate_legacy_session()
         doc = load_registry()
 
+    if not _initialized:
+        try:
+            report["reconcile"] = reconcile_accounts_from_disk()
+            doc = load_registry()
+        except Exception as exc:
+            logger.warning("reconcile accounts from disk: %s", exc)
+            report["reconcile_error"] = str(exc)[:200]
+
     active = str(doc.get("active_account_id") or "").strip()
     if not active and doc.get("accounts"):
         active = str(doc["accounts"][0].get("id") or "")
@@ -824,6 +979,28 @@ def resolve_import_target(rel: str) -> Path:
     except ValueError as exc:
         raise ValueError(f"pack path escapes account home: {mapped!r}") from exc
     return target
+
+
+def account_status_fast() -> dict[str, Any]:
+    """Registry + local session files only — no disk reconcile or network."""
+    doc = load_registry()
+    active = str(doc.get("active_account_id") or "").strip()
+    if not active and doc.get("accounts"):
+        active = str(doc["accounts"][0].get("id") or "")
+    rows: list[dict[str, Any]] = []
+    for row in doc.get("accounts") or []:
+        if not isinstance(row, dict):
+            continue
+        aid = str(row.get("id") or "")
+        if not aid or int(row.get("logged_out_at") or 0):
+            continue
+        rows.append(_build_account_row(row, active=active))
+    return {
+        "active_account_id": active,
+        "accounts": dedupe_account_rows(rows, active_id=active),
+        "session_dir": str(session_dir()),
+        "bundle_dir": str(bundle_dir()),
+    }
 
 
 def account_status() -> dict[str, Any]:

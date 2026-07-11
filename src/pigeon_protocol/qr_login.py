@@ -494,6 +494,7 @@ class DoudianSsoQrLoginClient:
         return self._cookie_dict()
 
     def open_feige_workspace(self) -> dict[str, str]:
+        from pigeon_protocol.pure_config import cdp_allowed
         from pigeon_protocol.session import load_session, save_session
         from pigeon_protocol.session_renewal import establish_im_session_http
 
@@ -504,7 +505,7 @@ class DoudianSsoQrLoginClient:
         try:
             session = load_session()
             session.cookies.update({k: v for k, v in cookies.items() if v})
-            renew = establish_im_session_http(session, persist=True)
+            renew = establish_im_session_http(session, persist=True, cdp_fallback=cdp_allowed())
             if renew.get("ok"):
                 save_session(session)
             cookies = dict(session.cookies)

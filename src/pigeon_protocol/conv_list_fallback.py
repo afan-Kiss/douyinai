@@ -37,6 +37,8 @@ def _normalize_uid(raw: str) -> str:
     uid = str(raw or "").strip()
     if not uid.startswith("AQ"):
         return ""
+    if uid.startswith("AQTest"):
+        return ""
     if len(uid) > 88:
         uid = uid[:88]
     return uid if len(uid) >= 50 else ""
@@ -231,8 +233,8 @@ def _user_card_hint(session, uid: str) -> dict[str, Any]:
     deal = int(trade.get("shop_deal_count") or 0)
     repeat = int(inner.get("repeat_come_count") or 0)
 
-    name = extract_buyer_name_from_obj(inner)
-    if name and is_bad_display_name(name):
+    name = extract_buyer_name_from_user_card(inner)
+    if name and is_bad_display_name(name, uid=uid):
         name = ""
 
     buyer_source = str(inner.get("user_from_desc") or "").strip()
@@ -241,7 +243,7 @@ def _user_card_hint(session, uid: str) -> dict[str, Any]:
         preview = f"成交{deal}单"
     elif repeat > 0:
         preview = f"复访{repeat}次"
-    elif buyer_source and not is_bad_display_name(buyer_source):
+    elif buyer_source and not is_bad_display_name(buyer_source, uid=uid):
         preview = buyer_source
 
     _debug_conv_card_dump(uid, inner, name, buyer_source or "user_card")
@@ -254,8 +256,11 @@ def _user_card_hint(session, uid: str) -> dict[str, Any]:
     }
 
 
-def list_conversations_fallback(session, *, limit: int = 30) -> dict[str, Any]:
+def list_conversations_fallback(session, *, limit: int = 30, skip_network: bool = False) -> dict[str, Any]:
     """Build minimal conv list from known UIDs + get_user_card (non-whale)."""
+    from pigeon_protocol.buyer_display_name import prune_untrusted_buyer_display_names
+
+    prune_untrusted_buyer_display_names(session, save=not skip_network, verify_user_card=not skip_network)
     uids = discover_security_uids(session, limit=limit)
     if not uids:
         return {
@@ -265,14 +270,32 @@ def list_conversations_fallback(session, *, limit: int = 30) -> dict[str, Any]:
             "api_code": 11001,
         }
 
+    from pigeon_protocol.buyer_display_name import (
+        buyer_label_from_uid,
+        get_buyer_display_names,
+        hint_buyer_name_from_context,
+    )
+
+    cached_names = get_buyer_display_names(session)
     items: list[dict[str, Any]] = []
     for uid in uids[:limit]:
-        hint = _user_card_hint(session, uid)
-        name = str(hint.get("name") or "").strip()
-        if not name or is_bad_display_name(name):
-            name = buyer_label_from_uid(uid)
-        preview_raw = str(hint.get("preview") or "已知买家")
-        preview = sanitize_conv_preview(preview_raw) or preview_raw
+        hint: dict[str, Any] = {}
+        if skip_network:
+            name = str(cached_names.get(uid) or "").strip()
+            if not name or is_bad_display_name(name, uid=uid):
+                name = hint_buyer_name_from_context(session, uid)
+            if not name or is_bad_display_name(name, uid=uid):
+                name = buyer_label_from_uid(uid)
+            preview = "已知买家"
+        else:
+            hint = _user_card_hint(session, uid)
+            name = str(cached_names.get(uid) or hint.get("name") or "").strip()
+            if not name or is_bad_display_name(name, uid=uid):
+                name = hint_buyer_name_from_context(session, uid)
+            if not name or is_bad_display_name(name, uid=uid):
+                name = buyer_label_from_uid(uid)
+            preview_raw = str(hint.get("preview") or "已知买家")
+            preview = sanitize_conv_preview(preview_raw) or preview_raw
         items.append(
             {
                 "security_user_id": uid,

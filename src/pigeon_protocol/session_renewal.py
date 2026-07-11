@@ -109,7 +109,17 @@ def renew_im_session_via_cdp(session, *, persist: bool = True, launch: bool = Tr
     抖店 session 仍有效时，Chrome profile 会自动 SSO 进飞鸽工作台。
     """
     from pigeon_protocol.feige_init import bootstrap_feige_session, probe_backstage_session
+    from pigeon_protocol.pure_config import cdp_allowed
     from pigeon_protocol.session import save_session
+
+    if not cdp_allowed():
+        return {
+            "ok": False,
+            "error": "纯协议模式已禁用 CDP",
+            "needs_cdp_onboard": False,
+            "skipped": True,
+            "via": "cdp_disabled",
+        }
 
     report: dict[str, Any] = {"steps": ["cdp_renew"], "via": "cdp_sync"}
     try:
@@ -167,6 +177,7 @@ def establish_im_session_http(session, *, persist: bool = True, cdp_fallback: bo
     对齐浏览器打开 im.jinritemai.com 后的 cookie / SSO 传递。
     """
     from pigeon_protocol.feige_init import bootstrap_feige_session, probe_backstage_session
+    from pigeon_protocol.pure_config import cdp_allowed
     from pigeon_protocol.session import save_session
 
     report: dict[str, Any] = {"steps": []}
@@ -253,7 +264,7 @@ def establish_im_session_http(session, *, persist: bool = True, cdp_fallback: bo
     report["ok"] = bool(probe2.get("ok"))
     if not report["ok"]:
         code = probe2.get("code") or ""
-        if code in ("10005",) and cdp_fallback:
+        if code in ("10005",) and cdp_fallback and cdp_allowed():
             report["steps"].append("http_10005_try_cdp")
             cdp = renew_im_session_via_cdp(session, persist=False, launch=True)
             report["cdp_renew"] = {
@@ -298,7 +309,9 @@ def renew_session_if_needed(session, *, persist: bool = True) -> dict[str, Any]:
         if ready.get("backstage_ok") and ready.get("listen_ready"):
             return {"ok": True, "skipped": True, "readiness": ready}
 
-    report = establish_im_session_http(session, persist=persist, cdp_fallback=True)
+    from pigeon_protocol.pure_config import cdp_allowed
+
+    report = establish_im_session_http(session, persist=persist, cdp_fallback=cdp_allowed())
     _BACKSTAGE_CACHE.clear()
     after = report.get("backstage_after")
     if not isinstance(after, dict) or not after:

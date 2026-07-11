@@ -166,12 +166,23 @@ def _finalize_conversation_items(
     *,
     session=None,
     enrich_user_card: bool = True,
+    light: bool = False,
 ) -> list[dict[str, Any]]:
-    from pigeon_protocol.buyer_display_name import enrich_items_with_user_card, normalize_conversation_items
+    from pigeon_protocol.buyer_display_name import (
+        enrich_items_light,
+        enrich_items_with_user_card,
+        normalize_conversation_items,
+        prune_untrusted_buyer_display_names,
+    )
 
+    if session is not None:
+        prune_untrusted_buyer_display_names(session, save=not light, verify_user_card=not light)
     normalized = normalize_conversation_items(items)
-    if enrich_user_card and session is not None and normalized:
-        return enrich_items_with_user_card(session, normalized)
+    if session is not None and normalized:
+        if light:
+            return enrich_items_light(session, normalized)
+        if enrich_user_card:
+            return enrich_items_with_user_card(session, normalized)
     return normalized
 
 
@@ -217,7 +228,7 @@ def _fetch_conversations_light(
 
     fresh = _cache_get(cache_key, allow_stale=False)
     if fresh and fresh.get("items"):
-        items = _finalize_conversation_items(list(fresh["items"]), session=session)
+        items = _finalize_conversation_items(list(fresh["items"]), session=session, light=True)
         return _light_response(
             ok=True,
             items=items,
@@ -233,7 +244,7 @@ def _fetch_conversations_light(
         skip_warm=True,
         snapshot_only=True,
     )
-    snap_items = _finalize_conversation_items(parse_conversation_items(snap_raw), session=session)
+    snap_items = _finalize_conversation_items(parse_conversation_items(snap_raw), session=session, light=True)
     if snap_items:
         payload = _cache_payload(items=snap_items, raw=snap_raw, source="snapshot")
         _cache_set(cache_key, payload)
@@ -242,8 +253,8 @@ def _fetch_conversations_light(
     try:
         from pigeon_protocol.conv_list_fallback import list_conversations_fallback
 
-        local_raw = list_conversations_fallback(session, limit=size)
-        local_items = _finalize_conversation_items(parse_conversation_items(local_raw), session=session)
+        local_raw = list_conversations_fallback(session, limit=size, skip_network=True)
+        local_items = _finalize_conversation_items(parse_conversation_items(local_raw), session=session, light=True)
         if local_items:
             payload = _cache_payload(items=local_items, raw=local_raw, source="local_snapshot")
             _cache_set(cache_key, payload)
@@ -262,7 +273,7 @@ def _fetch_conversations_light(
             skip_warm=True,
             request_timeout_sec=2.5,
         )
-        live_items = _finalize_conversation_items(parse_conversation_items(live_raw), session=session)
+        live_items = _finalize_conversation_items(parse_conversation_items(live_raw), session=session, light=True)
     except Exception as exc:
         live_raw = {"ok": False, "error": str(exc)}
 
@@ -273,7 +284,7 @@ def _fetch_conversations_light(
 
     stale = _cache_get(cache_key, allow_stale=True)
     if stale and stale.get("items"):
-        items = _finalize_conversation_items(list(stale["items"]), session=session)
+        items = _finalize_conversation_items(list(stale["items"]), session=session, light=True)
         return _light_response(
             ok=True,
             items=items,

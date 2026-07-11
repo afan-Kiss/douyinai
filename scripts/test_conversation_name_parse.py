@@ -137,7 +137,10 @@ def test_enrich_user_card(monkeypatch=None) -> None:
     items = [{"security_user_id": uid, "name": "其他", "display_name": "其他"}]
 
     class _Session:
-        pass
+        extra: dict = {}
+
+        def to_dict(self):
+            return {"extra": self.extra}
 
     def _fake_hint(_session, _uid: str) -> dict:
         return {
@@ -164,9 +167,40 @@ def test_preview_sanitize() -> None:
     _assert(p == "已知买家", p)
 
 
+def test_uid_fallback_label() -> None:
+    from pigeon_protocol.buyer_display_name import is_uid_fallback_label
+
+    uid = "AQCnSRsg6VjCVV6CzwN4oOAcHF9PP0l8Wt61aPf6eWv91CiWTitMouMi93A9JW_hl54iRJnOiiFe7Sfrh83xb6Nk"
+    _assert(is_uid_fallback_label("买家3xb6Nk", uid), "uid tail fallback should be bad")
+    _assert(is_bad_display_name("买家3xb6Nk", uid=uid), "uid tail fallback via is_bad_display_name")
+    _assert(not is_bad_display_name("一一潮玩", uid=uid), "real nickname should stay")
+
+
+def test_har_capture_buyer_nick() -> None:
+    from pathlib import Path
+
+    from pigeon_protocol.buyer_display_name import extract_buyer_nickname_for_uid, load_buyer_names_from_captures
+
+    uid = "AQCnSRsg6VjCVV6CzwN4oOAcHF9PP0l8Wt61aPf6eWv91CiWTitMouMi93A9JW_hl54iRJnOiiFe7Sfrh83xb6Nk"
+    root = Path(__file__).resolve().parents[1]
+    har = root / "captures/live/from_har/har_00318_http_body.json"
+    if not har.is_file():
+        return
+    import json
+
+    ev = json.loads(har.read_text(encoding="utf-8"))
+    body = str(ev.get("response_body") or "")
+    name = extract_buyer_nickname_for_uid(body, uid)
+    _assert(name == "一只小青蛙", f"expected 一只小青蛙 got {name!r}")
+    found = load_buyer_names_from_captures([uid])
+    _assert(found.get(uid) == "一只小青蛙", found)
+
+
 def main() -> int:
     tests = [
         test_bad_names,
+        test_uid_fallback_label,
+        test_har_capture_buyer_nick,
         test_fallback_user_from_desc_only,
         test_fallback_nested_nick,
         test_xundan_title_vs_nickname,

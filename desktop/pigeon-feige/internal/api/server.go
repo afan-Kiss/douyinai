@@ -224,13 +224,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		s.Bridge.RecordPingMs(int64(pingMs))
 		bridgeReady = err == nil
 	}
-	if !bridgeReady && pingMs < 0 {
-		t0 := time.Now()
-		_, err := s.Bridge.Call("ping", map[string]any{"oneshot": true})
-		if err == nil {
-			pingMs = int(time.Since(t0).Milliseconds())
-		}
-	}
 	degraded := !bridgeReady
 	writeJSON(w, 200, map[string]any{
 		"ok":                 goApiOk,
@@ -323,7 +316,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Query().Get("light") == "1" {
 		resp["active_account_id"] = protocol.ActiveAccountID(s.Root)
-		if acct, err := s.Bridge.Call("list_accounts", map[string]any{"oneshot": true}); err == nil && acct != nil {
+		if acct, err := bridgeCallWithTimeout(s.Bridge, "list_accounts", map[string]any{"fast": true}, 2*time.Second); err == nil && acct != nil {
 			if v, ok := acct["accounts"]; ok {
 				resp["accounts"] = v
 			}
@@ -342,9 +335,8 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, resp)
 		return
 	}
-	light := false
-	bridgeParams := map[string]any{"light": light}
-	out, err := s.Bridge.Call("session_status", bridgeParams)
+	bridgeParams := map[string]any{"light": false}
+	out, err := bridgeCallWithTimeout(s.Bridge, "session_status", bridgeParams, 8*time.Second)
 	if err == nil && out != nil {
 		for k, v := range out {
 			resp[k] = v
@@ -503,7 +495,13 @@ func (s *Server) handleConversations(w http.ResponseWriter, r *http.Request) {
 	if !light {
 		warmCSRF(s.Root)
 	}
-	out, err := s.Bridge.Call("conv_list", params)
+	var out map[string]any
+	var err error
+	if light {
+		out, err = bridgeCallWithTimeout(s.Bridge, "conv_list", params, 4*time.Second)
+	} else {
+		out, err = s.Bridge.Call("conv_list", params)
+	}
 	if !light && (err != nil || !convListOK(out)) {
 		_, _ = s.Bridge.Call("session_doctor", map[string]any{"fix": true})
 		out, err = s.Bridge.Call("conv_list", params)

@@ -167,8 +167,10 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
         )
 
     if action == "list_accounts":
-        from pigeon_protocol.account_context import account_status
+        from pigeon_protocol.account_context import account_status, account_status_fast
 
+        if bool(params.get("fast")):
+            return _ok(account_status_fast())
         return _ok(account_status())
 
     if action == "switch_account":
@@ -245,7 +247,7 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
         )
 
     if action == "session_status":
-        from pigeon_protocol.account_context import account_status
+        from pigeon_protocol.account_context import account_status, enrich_accounts_with_session_shop
         from pigeon_protocol.session import load_session
         from pigeon_protocol.session_keepalive import last_keepalive
 
@@ -255,7 +257,13 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
         session = load_session()
         cookies = session.cookies or {}
         logged_in = bool(cookies.get("sessionid") or cookies.get("sid_tt"))
-        acct = account_status()
+        light = bool(params.get("light"))
+        if light:
+            from pigeon_protocol.account_context import account_status_fast
+
+            acct = account_status_fast()
+        else:
+            acct = account_status()
         qr_snap = api.qr_active_snapshot()
         qr_active = bool(qr_snap.get("active"))
         aid = str(acct.get("active_account_id") or "")
@@ -267,10 +275,36 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
         snap = last_keepalive()
         ready = snap.get("readiness") if isinstance(snap.get("readiness"), dict) else {}
         shop = cookies.get("SHOP_ID") or session.shop_id or ""
-        from pigeon_protocol.shop_profile import ensure_shop_name
+        from pigeon_protocol.shop_profile import cached_shop_name, ensure_shop_name, infer_shop_id_from_session
 
-        light = bool(params.get("light"))
-        shop_name = ensure_shop_name(session, fetch=bool(logged_in) and not light)
+        if logged_in:
+            from pigeon_protocol.shop_profile import (
+                infer_shop_id_from_session,
+                is_placeholder_shop_label,
+            )
+
+            shop = infer_shop_id_from_session(session) or str(cookies.get("SHOP_ID") or session.shop_id or "")
+            cached = cached_shop_name(session)
+            if light:
+                shop_name = cached or ensure_shop_name(session, fetch=False)
+            else:
+                from pigeon_protocol.shop_profile import repair_session_shop_identity
+
+                need_repair = not shop or not cached or is_placeholder_shop_label(cached, shop)
+                if need_repair:
+                    repair_session_shop_identity(session, account_id=aid, set_active=True)
+                    acct = account_status()
+                    aid = str(acct.get("active_account_id") or aid)
+                    shop = infer_shop_id_from_session(session) or shop
+                shop_name = ensure_shop_name(session, fetch=not cached_shop_name(session))
+        else:
+            shop_name = "飞鸽客服"
+        accounts = enrich_accounts_with_session_shop(
+            acct.get("accounts") or [],
+            active_id=acct.get("active_account_id") or aid,
+            shop_name=shop_name,
+            shop_id=str(shop),
+        )
         send_ready = ready.get("send_ready")
         listen_ready = ready.get("listen_ready")
         if job.get("send_ready") is not None:
@@ -304,7 +338,7 @@ def handle(action: str, params: dict[str, Any]) -> dict[str, Any]:
                     "job_id": qr_snap.get("job_id", ""),
                 },
                 "active_account_id": acct.get("active_account_id"),
-                "accounts": acct.get("accounts") or [],
+                "accounts": accounts,
                 "send_ready": send_ready,
                 "listen_ready": listen_ready,
                 "backstage_ok": backstage_ok,

@@ -259,9 +259,9 @@ def qr_active_snapshot() -> dict[str, Any]:
 
 
 def session_status() -> dict[str, Any]:
-    from pigeon_protocol.account_context import account_status
+    from pigeon_protocol.account_context import account_status, enrich_accounts_with_session_shop
     from pigeon_protocol.session import load_session
-    from pigeon_protocol.shop_profile import ensure_shop_name
+    from pigeon_protocol.shop_profile import cached_shop_name, ensure_shop_name
 
     session = load_session()
     cookies = session.cookies or {}
@@ -287,14 +287,39 @@ def session_status() -> dict[str, Any]:
             "job_id": job.get("job_id", ""),
         }
     acct = account_status()
+    if logged_in:
+        from pigeon_protocol.shop_profile import (
+            cached_shop_name,
+            infer_shop_id_from_session,
+            is_placeholder_shop_label,
+            repair_session_shop_identity,
+        )
+
+        shop = infer_shop_id_from_session(session) or str(cookies.get("SHOP_ID") or session.shop_id or "")
+        cached = cached_shop_name(session)
+        need_repair = not shop or not cached or is_placeholder_shop_label(cached, shop)
+        if need_repair:
+            repair_session_shop_identity(session, account_id=aid, set_active=True)
+            acct = account_status()
+            aid = str(acct.get("active_account_id") or aid)
+            shop = infer_shop_id_from_session(session) or shop
+        shop_name = ensure_shop_name(session, fetch=not cached_shop_name(session))
+    else:
+        shop_name = "飞鸽客服"
+    accounts = enrich_accounts_with_session_shop(
+        acct.get("accounts") or [],
+        active_id=acct.get("active_account_id") or aid,
+        shop_name=shop_name,
+        shop_id=str(shop),
+    )
     return {
         "logged_in": logged_in,
         "shop_id": shop,
-        "shop_name": ensure_shop_name(session, fetch=bool(logged_in)) if shop else "飞鸽客服",
+        "shop_name": shop_name if shop or logged_in else "飞鸽客服",
         "cookie_count": len(cookies),
         "qr": qr,
         "active_account_id": acct.get("active_account_id") or aid,
-        "accounts": acct.get("accounts") or [],
+        "accounts": accounts,
     }
 
 
@@ -408,18 +433,30 @@ def _qr_finish_confirmed(
     try:
         client.apply_to_session(session, st)
         save_session(session)
+        try:
+            from pigeon_protocol.qr_login import QR_CONFIRMED
+
+            if str(getattr(st, "status", "") or "") == QR_CONFIRMED:
+                st.cookies = client.complete_fxg_login(st)
+                st.cookies.update(client.open_feige_workspace())
+                client.apply_to_session(session, st, replace_auth=False)
+                save_session(session)
+        except Exception as fxg_exc:
+            logger.warning("qr fxg complete: %s", fxg_exc)
         cookies = session.cookies or {}
         shop = str(session.cookies.get("SHOP_ID") or session.shop_id or "")
         cookie_count = len(cookies)
         try:
-            from pigeon_protocol.account_context import promote_account_to_shop, register_account, session_file
+            from pigeon_protocol.account_context import session_file
+            from pigeon_protocol.shop_profile import sync_session_shop_identity
 
-            if aid and shop:
-                canonical = promote_account_to_shop(aid, shop)
-                aid = canonical
-                job["account_id"] = canonical
-            elif aid:
-                register_account(aid, set_active=True)
+            canonical = sync_session_shop_identity(
+                session,
+                set_active=True,
+                source_account_id=aid,
+            )
+            aid = canonical
+            job["account_id"] = canonical
         except Exception as reg_exc:
             logger.warning("update account registry after qr: %s", reg_exc)
         logger.info(
@@ -546,11 +583,14 @@ def _qr_try_recover_after_scan(client, job: dict[str, Any], st: Any, token: str)
         user_identity_id=identity_id,
     )
     try:
+        from pigeon_protocol.pure_config import cdp_allowed
+
         recovered.cookies = client.complete_fxg_login(recovered)
         recovered.cookies.update(client.open_feige_workspace())
     except Exception as exc:
         logger.warning("qr recover after scan: %s", exc)
-        return False
+        if not _qr_has_auth_cookies(recovered.cookies):
+            return False
     _qr_finish_confirmed_async(client, recovered, job)
     return True
 
@@ -822,7 +862,7 @@ def qr_login_start(*, account_id: str | None = None) -> dict[str, Any]:
 
 def qr_login_status() -> dict[str, Any]:
     t0 = time.monotonic()
-    from pigeon_protocol.account_context import account_status
+    from pigeon_protocol.account_context import account_status, enrich_accounts_with_session_shop
     from pigeon_protocol.session import load_session
 
     aid = _active_account_id()
@@ -837,7 +877,10 @@ def qr_login_status() -> dict[str, Any]:
         qr_phase = str(job.get("phase") or "logged_out")
         qr_running = bool(job.get("running"))
         t = _qr_threads.get(aid)
-        if t and t.is_alive() and qr_phase in ("waiting_scan", "scanned", "fetching", "bootstrapping"):
+        if job.get("done") or job.get("logged_in"):
+            qr_phase = "logged_in"
+            qr_running = False
+        elif t and t.is_alive() and qr_phase in ("waiting_scan", "scanned", "fetching", "bootstrapping"):
             qr_running = True
         started = float(job.get("created_at") or job.get("qr_started_at") or 0)
         age = time.time() - started if started else 9999
@@ -854,7 +897,7 @@ def qr_login_status() -> dict[str, Any]:
             elif qr_phase in ("fetching", "waiting_scan", "scanned") and age < 120:
                 qr_phase = "fetching" if qr_phase == "fetching" else "waiting_scan"
                 qr_running = True
-        if qr_phase == "expired":
+        if qr_phase == "expired" and not job.get("done") and not job.get("logged_in"):
             scanned_at = float(job.get("scanned_at") or 0)
             subject_uid = str(job.get("login_subject_uid") or "")
             if not scanned_at and not subject_uid and age < 600:
@@ -893,15 +936,25 @@ def qr_login_status() -> dict[str, Any]:
         cookie_count = len(cookies)
         logged_in = bool(cookies.get("sessionid") or cookies.get("sid_tt"))
         shop = str(cookies.get("SHOP_ID") or session.shop_id or "")
-        from pigeon_protocol.shop_profile import ensure_shop_name
+        from pigeon_protocol.shop_profile import cached_shop_name, ensure_shop_name
 
-        shop_name = ensure_shop_name(session, fetch=bool(logged_in))
+        shop_name = ensure_shop_name(session, fetch=bool(logged_in) and not cached_shop_name(session))
+    elif qr_phase == "bootstrapping":
+        if aid:
+            from pigeon_protocol.account_context import apply_account_env
+
+            apply_account_env(aid)
+        session = load_session()
+        cookies = session.cookies or {}
+        cookie_count = len(cookies)
+        if cookies.get("sessionid") or cookies.get("sid_tt"):
+            logged_in = bool(job.get("logged_in") or job.get("done"))
     elif not qr_active:
         session = load_session()
         cookies = session.cookies or {}
         cookie_count = len(cookies)
 
-    if qr_active:
+    if qr_active and not (job.get("done") or job.get("logged_in")):
         logged_in = False
 
     elapsed_ms = (time.monotonic() - t0) * 1000
@@ -921,7 +974,12 @@ def qr_login_status() -> dict[str, Any]:
         "cookie_count": cookie_count,
         "qr": qr_public,
         "active_account_id": acct.get("active_account_id") or aid,
-        "accounts": acct.get("accounts") or [],
+        "accounts": enrich_accounts_with_session_shop(
+            acct.get("accounts") or [],
+            active_id=acct.get("active_account_id") or aid,
+            shop_name=shop_name,
+            shop_id=shop,
+        ),
         "send_ready": send_ready,
         "listen_ready": listen_ready,
         "blockers": blockers,

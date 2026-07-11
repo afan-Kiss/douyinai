@@ -61,6 +61,11 @@ def launch_feige_chrome(
 
 def ensure_cdp_ready(*, launch: bool = True, wait_sec: float = 30.0) -> bool:
     """Return True when CDP endpoint responds; optionally launch Chrome."""
+    from pigeon_protocol.pure_config import cdp_allowed
+
+    if not cdp_allowed():
+        return False
+
     port = cdp_port()
     if cdp_ready(port):
         return True

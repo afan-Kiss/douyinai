@@ -58,7 +58,7 @@
     humanTakeover: false,
     markedHuman: new Set(),
     riskWatch: new Set(),
-    ordersPanelOpen: window.innerWidth > 1100,
+    ordersPanelOpen: false,
     accounts: [],
     activeAccountId: "",
     lastSession: null,
@@ -68,6 +68,10 @@
   };
   let _progressCount = 0;
   let _progressTimer = null;
+  let _selectReqSeq = 0;
+  let _contextLoadGen = 0;
+  let _ordersLoadGen = 0;
+  let _ordersWideLayout = window.innerWidth > 1100;
 
   function showGlobalProgress() {
     _progressCount += 1;
@@ -136,12 +140,6 @@
     $("convCount").textContent = "—";
     $("convList").innerHTML = '<div class="empty-mini muted">切换账号后请刷新会话列表</div>';
   }
-
-  let _progressCount = 0;
-  let _progressTimer = null;
-  let _selectReqSeq = 0;
-  let _contextLoadGen = 0;
-  let _ordersLoadGen = 0;
 
   async function api(path, opt = {}) {
     const track = opt.trackProgress === true;
@@ -347,7 +345,19 @@
     return raw;
   }
 
+  function isUidFallbackName(name, uid) {
+    const n = String(name || "").trim().replace(/\s+/g, "");
+    if (!n) return false;
+    if (/^买家[A-Za-z0-9_-]{4,10}$/.test(n)) return true;
+    const u = String(uid || "");
+    if (u && n === `买家${u.slice(-6)}`) return true;
+    return false;
+  }
+
   function convName(c) {
+    const uid = String(c.security_user_id || "");
+    const meta = state.convMeta[uid] || {};
+    if (meta.buyerName && !isUidFallbackName(meta.buyerName, uid)) return meta.buyerName;
     const candidates = [
       c.display_name,
       c.buyer_name,
@@ -358,10 +368,9 @@
     ];
     for (const v of candidates) {
       const cleaned = cleanBuyerName(v);
-      if (cleaned) return cleaned;
+      if (cleaned && !isUidFallbackName(cleaned, uid)) return cleaned;
     }
-    const uid = String(c.security_user_id || "");
-    return uid ? `买家 ${uid.slice(-6)}` : "未知买家";
+    return uid ? `买家${uid.slice(-6)}` : "未知买家";
   }
 
   function avatarChar(name) {
@@ -414,6 +423,7 @@
 
   function isQrFlowActive(j) {
     const qr = (j && j.qr) || {};
+    if (qr.done || qr.logged_in) return false;
     if (j.logged_in && (qr.phase === "bootstrapping" || qr.phase === "logged_in")) return false;
     if (qr.phase === "bootstrapping" || qr.phase === "scanned") return true;
     if (!qr.running) return false;
@@ -427,9 +437,22 @@
   }
 
   function effectiveLoggedIn(j) {
-    if (Boolean(j.logged_in ?? j.session_alive)) return true;
-    if (isQrFlowActive(j)) return false;
+    if (Boolean(j?.logged_in)) return true;
     return false;
+  }
+
+  function updateAuthChrome() {
+    const loggedIn = Boolean(state.loggedIn);
+    document.body.classList.toggle("auth-logged-in", loggedIn);
+    document.body.classList.toggle("auth-logged-out", !loggedIn);
+    const btnLogout = $("btnLogoutAccount");
+    if (btnLogout) btnLogout.hidden = !loggedIn;
+    const loginCard = $("loginCard");
+    if (loginCard) {
+      loginCard.classList.toggle("login-card--logged-in", loggedIn);
+      loginCard.classList.toggle("login-card--logged-out", !loggedIn);
+    }
+    document.querySelector(".workspace")?.classList.toggle("workspace--guest", !loggedIn);
   }
 
   function syncLoginState(j) {
@@ -440,15 +463,16 @@
     if (state.qrPollingActive) {
       const qr = j.qr || {};
       const qrDone = Boolean(qr.done || qr.phase === "logged_in");
-      state.loggedIn = qrDone && (Boolean(j.logged_in) || Boolean(activeRow?.logged_in));
+      state.loggedIn = qrDone && Boolean(j.logged_in);
     } else {
-      state.loggedIn = effectiveLoggedIn(j) || Boolean(activeRow?.logged_in);
+      state.loggedIn = effectiveLoggedIn(j);
     }
     const onboard = j.onboard || {};
     state.loginPhase =
       onboard.phase && onboard.phase !== "idle"
         ? onboard.phase
         : j.qr?.phase || (state.loggedIn ? "logged_in" : "logged_out");
+    updateAuthChrome();
     return { activeRow };
   }
 
@@ -491,11 +515,24 @@
     const shop = String(a.shop_id || "").trim();
     const shopName = String(a.shop_name || "").trim();
     const label = String(a.label || "").trim();
-    if (a.is_empty_slot || label === "扫码登录新店铺") return "扫码登录新店铺";
-    const looksLikeId = (v) => !v || v === shop || /^店铺\s*\d+$/.test(v) || /^shop_\d+$/i.test(v) || /^acct_[0-9a-f]+$/i.test(v);
+    const looksLikeId = (v) =>
+      !v ||
+      v === shop ||
+      /^店铺\s*\d+$/.test(v) ||
+      /^shop_\d+$/i.test(v) ||
+      /^acct_[0-9a-f]+$/i.test(v);
+    const sessionName = String(state.lastSession?.shop_name || "").trim();
+    const isActiveLoggedIn =
+      a.logged_in && String(a.id || "") === String(state.activeAccountId || "");
+    if (isActiveLoggedIn && sessionName && !looksLikeId(sessionName) && sessionName !== "飞鸽客服") {
+      return sessionName;
+    }
+    if (a.is_empty_slot && !a.logged_in) return "扫码登录新店铺";
+    if (!a.logged_in && label === "扫码登录新店铺") return "扫码登录新店铺";
     if (shopName && !looksLikeId(shopName)) return shopName;
-    if (label && label !== "空账号槽" && !looksLikeId(label)) return label;
-    if (shop) return shop; // last resort: raw id without「店铺」prefix
+    if (label && label !== "空账号槽" && !looksLikeId(label) && label !== "扫码登录新店铺") return label;
+    if (shop && !looksLikeId(shop)) return shop;
+    if (a.logged_in) return sessionName && sessionName !== "飞鸽客服" ? sessionName : shop || label || "已登录店铺";
     return "扫码登录新店铺";
   }
 
@@ -526,7 +563,7 @@
       const opt = document.createElement("option");
       opt.value = a.id === "__new_shop__" ? "" : a.id;
       const name = accountPickerLabel(a);
-      if (a.id === active && a.logged_in) {
+      if (a.id === active && (a.logged_in || isActiveAccountLoggedIn())) {
         opt.textContent = `当前 · ${name}`;
       } else if (a.logged_in) {
         opt.textContent = name;
@@ -592,6 +629,7 @@
 
   function qrLoginSucceeded(j) {
     const qr = j.qr || {};
+    if (qr.done || qr.logged_in || qr.phase === "logged_in") return true;
     if (qr.done && j.logged_in) return true;
     const cookiesReady = Boolean(j.logged_in || Number(j.cookie_count || 0) > 0);
     if (!cookiesReady) return false;
@@ -601,29 +639,40 @@
   async function logoutCurrentAccount() {
     if (!state.loggedIn && !state.activeAccountId) return;
     if (!confirm("确定退出当前店铺吗？退出后该店铺需要重新扫码登录。")) return;
+    const logoutAid = state.activeAccountId || "";
     try {
+      stopQrPoll();
+      resetWorkspaceState();
+      state.listenOn = false;
+      state.loggedIn = false;
+      state.loginPhase = "logged_out";
+      _lastLoginRenderKey = "";
+      updateAuthChrome();
+      renderLogin({ logged_in: false, qr: { phase: "logged_out" }, shop_name: "飞鸽客服" });
+      renderAccountPicker();
+
       const j = await api("/api/accounts/logout", {
         method: "POST",
-        body: JSON.stringify({ account_id: state.activeAccountId || "" }),
+        body: JSON.stringify({ account_id: logoutAid }),
         trackProgress: true,
       });
       if (j.ok === false) {
         toast("退出失败: " + (j.error || "未知错误"));
+        await refreshLogin(false);
         return;
       }
-      stopQrPoll();
-      resetWorkspaceState();
-      state.listenOn = false;
+      state.activeAccountId = j.active_account_id || j.switched_to || state.activeAccountId;
+      state.loggedIn = Boolean(j.logged_in);
+      state.loginPhase = state.loggedIn ? "logged_in" : "logged_out";
       _lastLoginRenderKey = "";
       await refreshLogin(false);
-      renderAccountPicker();
-      const switched = j.switched_to || j.active_account_id || "";
-      if (switched && j.logged_in) {
-        await refreshConversations(false, "recent", { heavy: false });
+      if (!state.loggedIn) {
+        renderLogin({ logged_in: false, qr: { phase: "logged_out" }, shop_name: "飞鸽客服" });
       }
-      toast("已退出当前店铺");
+      toast(state.loggedIn ? "已切换至其他已登录店铺" : "已退出，请扫码登录");
     } catch (e) {
       toast("退出失败: " + (e.message || e));
+      await refreshLogin(false);
     }
   }
 
@@ -840,6 +889,7 @@
       const j = await api("/api/cdp-onboard/status", BG_API);
       const ob = j.onboard || j;
       state.loggedIn = Boolean(j.logged_in);
+      updateAuthChrome();
       renderLogin({
         logged_in: j.logged_in,
         send_ready: j.send_ready,
@@ -911,6 +961,7 @@
     state.qrPollingActive = true;
     state.qrStartedAt = Date.now();
     state.loginPhase = "fetching";
+    updateAuthChrome();
     renderLogin({ logged_in: false, qr: { phase: "fetching", running: true } });
     await waitBridgeReady();
     const j = await api("/api/qr-login/start", { method: "POST", body: "{}", trackProgress: true });
@@ -1018,6 +1069,10 @@
         return;
       }
       if (j.qr?.phase === "bootstrapping") {
+        if (qrLoginSucceeded(j)) {
+          await completeQrLoginSuccess(j);
+          return;
+        }
         if (
           state.qrPollingActive &&
           Date.now() - state.qrStartedAt > 3 * 60 * 1000 &&
@@ -1170,6 +1225,36 @@
     });
   }
 
+  async function enrichConvDisplayNames() {
+    const pending = (state.conversations || []).filter((c) => {
+      const uid = String(c.security_user_id || "");
+      return uid && isUidFallbackName(convName(c), uid);
+    });
+    if (!pending.length) return;
+    for (const c of pending.slice(0, 5)) {
+      const uid = c.security_user_id;
+      try {
+        const j = await api(`/api/context?user_id=${encodeURIComponent(uid)}`, {
+          ...BG_API,
+          timeoutMs: 5000,
+        });
+        const ctx = j.context || {};
+        const name = cleanBuyerName(ctx.buyer_name);
+        if (!name || isUidFallbackName(name, uid)) continue;
+        const meta = state.convMeta[uid] || {};
+        meta.buyerName = name;
+        state.convMeta[uid] = meta;
+        c.display_name = name;
+        c.buyer_name = name;
+        c.name = name;
+      } catch {
+        /* skip single buyer name enrich failure */
+      }
+    }
+    renderConvList();
+    updateBuyerMeta(state.currentUid);
+  }
+
   async function refreshConversations(showProgress = false, category, { heavy = false } = {}) {
     const cat = category || state.activeCategory;
     if (!isActiveAccountLoggedIn()) {
@@ -1190,7 +1275,7 @@
           timeoutMs: heavy ? 8000 : 5000,
         }
       );
-      if (!j.ok && !(j.items || []).length) {
+      if (!j.ok && !(j.items || []).length && !j.timeout && showProgress) {
         toast((j.raw && j.raw.error) || j.error || "会话列表拉取失败，可点刷新重试");
       }
       state.conversations = j.items || [];
@@ -1203,7 +1288,7 @@
         }
       }
     } catch (e) {
-      toast("无法拉取会话: " + (e.message || e));
+      if (showProgress) toast("无法拉取会话: " + (e.message || e));
       state.conversations = [];
     }
     state.conversations.forEach((c) => {
@@ -1212,6 +1297,7 @@
       if (!state.convMeta[uid]) state.convMeta[uid] = { aiStatus: "wait" };
     });
     renderConvList();
+    void enrichConvDisplayNames();
     if (!state.currentUid && state.conversations[0]?.security_user_id) {
       await selectConversation(state.conversations[0].security_user_id);
     }
@@ -1265,9 +1351,14 @@
       const meta = state.convMeta[uid] || {};
       meta.buyerName = cleanBuyerName(ctx.buyer_name) || fallbackName;
       state.convMeta[uid] = meta;
+      if (conv && meta.buyerName && !isUidFallbackName(meta.buyerName, uid)) {
+        conv.display_name = meta.buyerName;
+        conv.buyer_name = meta.buyerName;
+        conv.name = meta.buyerName;
+      }
+      renderConvList();
+      updateBuyerMeta(uid);
     }
-
-    updateBuyerMeta(uid);
     renderMessages();
     renderBuyerOverview();
     renderInsight();
@@ -1705,24 +1796,38 @@
     return window.innerWidth <= 1100;
   }
 
+  function defaultOrdersPanelOpen() {
+    return window.innerWidth > 1100;
+  }
+
   function setOrdersPanelOpen(open) {
     state.ordersPanelOpen = open;
     const ws = document.querySelector(".workspace");
     const drawer = $("orderDrawer");
     const backdrop = $("drawerBackdrop");
     if (useOrderDrawer()) {
-      ws.classList.remove("orders-collapsed");
+      ws?.classList.remove("orders-collapsed");
       drawer?.classList.toggle("is-open", open);
       backdrop?.classList.toggle("is-open", open);
       if (drawer) drawer.hidden = !open;
       if (backdrop) backdrop.hidden = !open;
     } else {
-      ws.classList.toggle("orders-collapsed", !open);
+      ws?.classList.toggle("orders-collapsed", !open);
       drawer?.classList.remove("is-open");
       backdrop?.classList.remove("is-open");
       if (drawer) drawer.hidden = true;
       if (backdrop) backdrop.hidden = true;
     }
+  }
+
+  function syncOrdersPanelLayout() {
+    const wide = window.innerWidth > 1100;
+    if (wide !== _ordersWideLayout) {
+      setOrdersPanelOpen(wide ? true : false);
+      _ordersWideLayout = wide;
+      return;
+    }
+    setOrdersPanelOpen(state.ordersPanelOpen);
   }
 
   function closeOrdersPanel() {
@@ -1849,42 +1954,47 @@
   }
 
   async function init() {
-    bindEvents();
-    _progressCount = 0;
-    $("globalProgress")?.classList.remove("done");
-    if ($("globalProgress")) $("globalProgress").hidden = true;
-    setOrdersPanelOpen(state.ordersPanelOpen);
-    window.addEventListener("resize", () => {
-      setOrdersPanelOpen(state.ordersPanelOpen);
-    });
-    renderConvTabs();
-    setConn(true, "连接中…");
-    await waitBridgeReady();
-    const h = await api("/api/health", { ...BG_API, timeoutMs: 5000 });
-    if (h.ok === false && !h.go_api_ok) setConn(false, h.error || "后端异常");
-    else if (h.degraded || h.bridge_ready === false) setConn(true, "Bridge 初始化中");
-    else setConn(true, "连接正常");
-    void api("/api/session/bootstrap", { method: "POST", body: "{}", ...BG_API, timeoutMs: 3000 });
-    void api("/api/session/keepalive", { method: "POST", body: "{}", ...BG_API, timeoutMs: 5000 });
-    await refreshLogin();
-    void refreshProtocolStatus();
-    setInterval(pollEvents, 2000);
-    setInterval(() => {
-      if (state.loggedIn && !state.qrPollingActive) {
-        refreshConversations(false, state.activeCategory, { heavy: false });
-      }
-    }, 90000);
-    setInterval(async () => {
-      try {
-        const j = await api("/api/session/keepalive", { method: "POST", body: "{}", ...BG_API });
-        if (j.renew?.ok || j.readiness?.backstage_ok) {
-          await refreshProtocolStatus();
-          if (j.readiness?.send_ready) await refreshLogin();
+    try {
+      bindEvents();
+      _progressCount = 0;
+      $("globalProgress")?.classList.remove("done");
+      if ($("globalProgress")) $("globalProgress").hidden = true;
+      _ordersWideLayout = window.innerWidth > 1100;
+      setOrdersPanelOpen(defaultOrdersPanelOpen());
+      window.addEventListener("resize", syncOrdersPanelLayout);
+      updateAuthChrome();
+      renderConvTabs();
+      setConn(true, "连接中…");
+      await waitBridgeReady();
+      const h = await api("/api/health", { ...BG_API, timeoutMs: 5000 });
+      if (h.ok === false && !h.go_api_ok) setConn(false, h.error || "后端异常");
+      else if (h.degraded || h.bridge_ready === false) setConn(true, "Bridge 初始化中");
+      else setConn(true, "连接正常");
+      void api("/api/session/bootstrap", { method: "POST", body: "{}", ...BG_API, timeoutMs: 3000 });
+      void api("/api/session/keepalive", { method: "POST", body: "{}", ...BG_API, timeoutMs: 5000 });
+      void refreshLogin();
+      void refreshProtocolStatus();
+      setInterval(pollEvents, 2000);
+      setInterval(() => {
+        if (state.loggedIn && !state.qrPollingActive) {
+          refreshConversations(false, state.activeCategory, { heavy: false });
         }
-      } catch {
-        /* silent auto keepalive */
-      }
-    }, 10 * 60 * 1000);
+      }, 90000);
+      setInterval(async () => {
+        try {
+          const j = await api("/api/session/keepalive", { method: "POST", body: "{}", ...BG_API });
+          if (j.renew?.ok || j.readiness?.backstage_ok) {
+            await refreshProtocolStatus();
+            if (j.readiness?.send_ready) await refreshLogin();
+          }
+        } catch {
+          /* silent auto keepalive */
+        }
+      }, 10 * 60 * 1000);
+    } catch (e) {
+      console.error("[init]", e);
+      setConn(false, "前端加载失败");
+    }
   }
 
   if (document.readyState === "loading") {
