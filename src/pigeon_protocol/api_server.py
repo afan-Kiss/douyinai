@@ -1011,6 +1011,7 @@ def switch_active_account(account_id: str, *, restart_listen: bool = True) -> di
             start_listen()
     return {
         **result,
+        "active_account_id": account_id,
         "accounts": session_status().get("accounts") or [],
         "logged_in": session_status().get("logged_in"),
     }

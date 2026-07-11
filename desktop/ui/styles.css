@@ -309,6 +309,9 @@ body.auth-logged-out #btnToggleOrders {
 body.auth-logged-in #btnLogoutAccount {
   display: inline-flex;
 }
+.auth-sync-banner { margin: 0 16px 8px; padding: 8px 10px; border-radius: 8px; font-size: 12px; }
+#convCount.is-refreshing::after { content: " · 刷新中"; color: var(--text-muted); font-weight: 400; }
+body.auth-degraded .login-card { border-color: rgba(232, 148, 58, 0.35); }
 body.auth-logged-out #btnLogoutAccount {
   display: none;
 }

@@ -36,11 +36,21 @@
     other: "其他",
   };
 
+  const UI = () => (typeof PigeonUIState !== "undefined" ? PigeonUIState : {});
+
   const state = {
     loggedIn: false,
     loginPhase: "checking",
+    authStatus: "unknown",
+    authGeneration: 0,
+    authPendingAction: null,
+    authLastTrusted: null,
+    authSyncError: "",
     conversations: [],
     convMeta: {},
+    convListStatus: "idle",
+    convListRequestId: 0,
+    convLastSuccess: null,
     activeCategory: "all",
     currentUid: "",
     messages: [],
@@ -58,13 +68,20 @@
     humanTakeover: false,
     markedHuman: new Set(),
     riskWatch: new Set(),
-    ordersPanelOpen: false,
+    desktopOrdersPrefOpen: true,
+    ordersDrawerOpen: false,
     accounts: [],
     activeAccountId: "",
+    accountGeneration: 0,
     lastSession: null,
     qrPollingActive: false,
     qrStartedAt: 0,
     lastQrRefreshAt: 0,
+    qrTaskId: "",
+    qrGeneration: 0,
+    qrTargetAccountId: "",
+    enrichInFlight: new Set(),
+    enrichFailedAt: {},
   };
   let _progressCount = 0;
   let _progressTimer = null;
@@ -72,6 +89,105 @@
   let _contextLoadGen = 0;
   let _ordersLoadGen = 0;
   let _ordersWideLayout = window.innerWidth > 1100;
+  let _convAbortController = null;
+  let _authRefreshGen = 0;
+  const actionLocks = {
+    qr: { busy: false, token: 0 },
+    switch: { busy: false, token: 0 },
+    logout: { busy: false, token: 0 },
+  };
+
+  function tryAcquireLock(kind) {
+    const lock = actionLocks[kind];
+    if (!lock || lock.busy) return null;
+    lock.busy = true;
+    lock.token += 1;
+    return lock.token;
+  }
+
+  function releaseLock(kind, token) {
+    const lock = actionLocks[kind];
+    if (!lock || lock.token !== token) return;
+    lock.busy = false;
+  }
+
+  function isLockBusy(kind) {
+    return Boolean(actionLocks[kind]?.busy);
+  }
+
+  function bumpAuthGeneration() {
+    state.authGeneration += 1;
+    return state.authGeneration;
+  }
+
+  function bumpAccountGeneration() {
+    state.accountGeneration += 1;
+    _selectReqSeq += 1;
+    _contextLoadGen += 1;
+    _ordersLoadGen += 1;
+    if (_convAbortController) {
+      _convAbortController.abort();
+      _convAbortController = null;
+    }
+    state.enrichInFlight.clear();
+    return state.accountGeneration;
+  }
+
+  function rememberTrustedAuth(j) {
+    if (!j || j.timeout || (j.ok === false && j.logged_in === undefined && !j.accounts)) return;
+    state.authLastTrusted = {
+      loggedIn: effectiveLoggedIn(j),
+      activeAccountId: String(j.active_account_id || state.activeAccountId || ""),
+      accounts: (j.accounts || []).slice(),
+      shopName: j.shop_name || "",
+      at: Date.now(),
+      generation: state.authGeneration,
+    };
+    state.authSyncError = "";
+    if (state.authStatus === UI().AUTH_STATUS?.DEGRADED) {
+      state.authStatus = state.authLastTrusted.loggedIn
+        ? UI().AUTH_STATUS?.LOGGED_IN || "logged_in"
+        : UI().AUTH_STATUS?.LOGGED_OUT || "logged_out";
+    }
+  }
+
+  function restoreTrustedAuth() {
+    const t = state.authLastTrusted;
+    if (!t) return false;
+    state.loggedIn = Boolean(t.loggedIn);
+    state.activeAccountId = t.activeAccountId || state.activeAccountId;
+    state.accounts = (t.accounts || []).slice();
+    state.authStatus = t.loggedIn
+      ? UI().AUTH_STATUS?.LOGGED_IN || "logged_in"
+      : UI().AUTH_STATUS?.LOGGED_OUT || "logged_out";
+    updateAuthChrome();
+    renderAccountPicker();
+    return true;
+  }
+
+  function setAuthSyncDegraded(message) {
+    state.authStatus = UI().AUTH_STATUS?.DEGRADED || "degraded";
+    state.authSyncError = message || "状态同步异常，正在重试";
+    updateAuthChrome();
+    renderAuthSyncBanner();
+  }
+
+  function renderAuthSyncBanner() {
+    const card = $("loginCard");
+    if (!card) return;
+    let banner = $("authSyncBanner");
+    if (!state.authSyncError) {
+      if (banner) banner.remove();
+      return;
+    }
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.id = "authSyncBanner";
+      banner.className = "status-err auth-sync-banner";
+      card.insertBefore(banner, $("loginBody"));
+    }
+    banner.textContent = state.authSyncError;
+  }
 
   function showGlobalProgress() {
     _progressCount += 1;
@@ -397,6 +513,7 @@
     warming: ["预热发信", "正在捕获 169B 发信密钥（约 30 秒）…"],
     done: ["登录完成", "协议已就绪"],
     error: ["登录失败", ""],
+    logging_out: ["正在退出当前店铺", "请稍候，正在清理登录状态…"],
   };
 
   let _lastLoginRenderKey = "";
@@ -421,15 +538,6 @@
     stopQrImgRefresh();
   }
 
-  function isQrFlowActive(j) {
-    const qr = (j && j.qr) || {};
-    if (qr.done || qr.logged_in) return false;
-    if (j.logged_in && (qr.phase === "bootstrapping" || qr.phase === "logged_in")) return false;
-    if (qr.phase === "bootstrapping" || qr.phase === "scanned") return true;
-    if (!qr.running) return false;
-    return ["fetching", "waiting_scan", "scanned", "bootstrapping"].includes(qr.phase);
-  }
-
   function isActiveAccountLoggedIn() {
     if (state.loggedIn) return true;
     const row = (state.accounts || []).find((a) => a.id === state.activeAccountId);
@@ -437,28 +545,49 @@
   }
 
   function effectiveLoggedIn(j) {
-    if (Boolean(j?.logged_in)) return true;
-    return false;
+    const fn = UI().effectiveLoggedIn;
+    return fn ? fn(j) : Boolean(j?.logged_in === true);
+  }
+
+  function isQrFlowActive(j) {
+    const fn = UI().isQrFlowActive;
+    return fn ? fn(j) : false;
   }
 
   function updateAuthChrome() {
     const loggedIn = Boolean(state.loggedIn);
     document.body.classList.toggle("auth-logged-in", loggedIn);
     document.body.classList.toggle("auth-logged-out", !loggedIn);
+    document.body.classList.toggle("auth-degraded", state.authStatus === (UI().AUTH_STATUS?.DEGRADED || "degraded"));
     const btnLogout = $("btnLogoutAccount");
-    if (btnLogout) btnLogout.hidden = !loggedIn;
+    if (btnLogout) {
+      btnLogout.hidden = !loggedIn;
+      btnLogout.disabled = isLockBusy("logout") || isLockBusy("switch");
+    }
+    const btnAdd = $("btnAddAccount");
+    if (btnAdd) btnAdd.disabled = isLockBusy("logout") || isLockBusy("switch") || isLockBusy("qr");
+    const sel = $("accountSelect");
+    if (sel) sel.disabled = isLockBusy("logout") || isLockBusy("switch");
+    const btnOrders = $("btnToggleOrders");
+    if (btnOrders) {
+      btnOrders.disabled = !loggedIn;
+      btnOrders.title = loggedIn ? "订单侧栏" : "登录后可查看订单";
+    }
     const loginCard = $("loginCard");
     if (loginCard) {
       loginCard.classList.toggle("login-card--logged-in", loggedIn);
       loginCard.classList.toggle("login-card--logged-out", !loggedIn);
     }
     document.querySelector(".workspace")?.classList.toggle("workspace--guest", !loggedIn);
+    renderAuthSyncBanner();
   }
 
-  function syncLoginState(j) {
-    state.lastSession = j;
-    state.accounts = j.accounts || [];
-    state.activeAccountId = j.active_account_id || "";
+  function syncLoginState(j, { trust = true } = {}) {
+    if (trust) {
+      state.lastSession = j;
+      state.accounts = j.accounts || [];
+      state.activeAccountId = j.active_account_id || "";
+    }
     const activeRow = state.accounts.find((a) => a.id === state.activeAccountId);
     if (state.qrPollingActive) {
       const qr = j.qr || {};
@@ -472,13 +601,45 @@
       onboard.phase && onboard.phase !== "idle"
         ? onboard.phase
         : j.qr?.phase || (state.loggedIn ? "logged_in" : "logged_out");
+    if (state.authPendingAction === "logging_out") {
+      state.authStatus = UI().AUTH_STATUS?.LOGGING_OUT || "logging_out";
+    } else if (state.authPendingAction === "switching") {
+      state.authStatus = UI().AUTH_STATUS?.SWITCHING || "switching";
+    } else if (state.qrPollingActive) {
+      state.authStatus = UI().AUTH_STATUS?.LOGGING_IN || "logging_in";
+    } else if (state.loggedIn) {
+      state.authStatus = UI().AUTH_STATUS?.LOGGED_IN || "logged_in";
+    } else {
+      state.authStatus = UI().AUTH_STATUS?.LOGGED_OUT || "logged_out";
+    }
+    if (trust) rememberTrustedAuth(j);
     updateAuthChrome();
     return { activeRow };
   }
 
   async function refreshLogin(forceConv = false) {
+    const reqGen = ++_authRefreshGen;
+    const snapshotGen = state.authGeneration;
+    if (state.authStatus !== (UI().AUTH_STATUS?.LOGGING_OUT || "logging_out") &&
+        state.authStatus !== (UI().AUTH_STATUS?.SWITCHING || "switching")) {
+      state.authStatus = UI().AUTH_STATUS?.CHECKING || "checking";
+    }
     try {
       const j = await api("/api/session?light=1", BG_API);
+      if (reqGen !== _authRefreshGen) return;
+      const gate = UI().shouldApplySessionSnapshot
+        ? UI().shouldApplySessionSnapshot(j, { authGeneration: snapshotGen, snapshotGeneration: snapshotGen })
+        : { apply: !(j.timeout || (j.ok === false && !j.accounts && j.logged_in === undefined)), degraded: Boolean(j.timeout) };
+      if (!gate.apply) {
+        if (gate.degraded) {
+          setAuthSyncDegraded(j.timeout ? "状态同步超时，保留上次登录状态" : "状态同步失败，保留上次登录状态");
+          restoreTrustedAuth();
+          if (state.authLastTrusted) {
+            renderLogin(state.lastSession || { logged_in: state.authLastTrusted.loggedIn, accounts: state.authLastTrusted.accounts });
+          }
+        }
+        return;
+      }
       const { activeRow } = syncLoginState(j);
       if (state.qrPollingActive && !state.loggedIn) {
         renderAccountPicker();
@@ -487,6 +648,7 @@
       const loggedInRows = state.accounts.filter((a) => a.logged_in);
       if (
         !state.qrPollingActive &&
+        !state.authPendingAction &&
         !activeRow?.logged_in &&
         loggedInRows.length === 1 &&
         loggedInRows[0].id !== state.activeAccountId
@@ -502,12 +664,19 @@
           await refreshConversations(forceConv, state.activeCategory || "recent", { heavy: false });
         }
         await syncListenStatus();
-        if (!state.listenOn && j.listen_ready !== false) {
+        if (!state.listenOn && j.listen_ready !== false && !isLockBusy("logout") && !isLockBusy("switch")) {
           await startListening();
         }
       }
     } catch {
-      renderLogin({ logged_in: false, qr: { phase: "error", error: "无法连接后端" } });
+      if (reqGen !== _authRefreshGen) return;
+      if (restoreTrustedAuth()) {
+        setAuthSyncDegraded("无法连接后端，保留上次登录状态");
+        renderLogin(state.lastSession || { logged_in: state.authLastTrusted?.loggedIn, accounts: state.authLastTrusted?.accounts || [] });
+      } else {
+        state.authStatus = UI().AUTH_STATUS?.ERROR || "error";
+        renderLogin({ logged_in: false, qr: { phase: "error", error: "无法连接后端" } });
+      }
     }
   }
 
@@ -576,7 +745,7 @@
   }
 
   async function switchAccount(accountId, opts = {}) {
-    if (!accountId) return;
+    if (!accountId || isLockBusy("switch") || isLockBusy("logout")) return;
     const preserveQr = Boolean(opts.preserveQr);
     const same = accountId === state.activeAccountId;
     if (same && !preserveQr) {
@@ -589,29 +758,92 @@
       return;
     }
     if (same) return;
+
+    const lockToken = tryAcquireLock("switch");
+    if (lockToken == null) return;
+
+    const snapshot = UI().createWorkspaceSnapshot ? UI().createWorkspaceSnapshot(state) : null;
+    const prevAccountId = state.activeAccountId;
+    const sel = $("accountSelect");
+    if (sel) sel.value = prevAccountId;
+
+    state.authPendingAction = "switching";
+    bumpAuthGeneration();
     if (!preserveQr) toast("正在切换账号…");
     if (!preserveQr) {
       resetWorkspaceState();
       state.listenOn = false;
     }
+    updateAuthChrome();
+
     try {
-      await api("/api/accounts/switch", {
+      const j = await api("/api/accounts/switch", {
         method: "POST",
         body: JSON.stringify({ account_id: accountId, restart_listen: !preserveQr }),
         trackProgress: !preserveQr,
       });
+      if (lockToken !== actionLocks.switch.token) return;
+      const valid = UI().validateAccountSwitchResult
+        ? UI().validateAccountSwitchResult(j, accountId)
+        : { ok: j.ok !== false && String(j.active_account_id || j.account_id || "") === accountId, error: j.error };
+      if (!valid.ok) {
+        if (snapshot) restoreWorkspaceSnapshot(snapshot);
+        state.activeAccountId = prevAccountId;
+        if (sel) sel.value = prevAccountId;
+        renderAccountPicker();
+        toast("切换失败: " + (valid.error || "请重试"));
+        await refreshLogin(false);
+        return;
+      }
       if (!preserveQr) {
         state.eventSince = 0;
+        state.activeAccountId = valid.activeAccountId || accountId;
         await refreshLogin(false);
         await refreshConversations(true, state.activeCategory || "recent", { heavy: false });
         toast("已切换账号");
       } else {
-        state.activeAccountId = accountId;
+        state.activeAccountId = valid.activeAccountId || accountId;
         renderAccountPicker();
       }
     } catch (e) {
+      if (lockToken !== actionLocks.switch.token) return;
+      if (snapshot) restoreWorkspaceSnapshot(snapshot);
+      state.activeAccountId = prevAccountId;
+      if (sel) sel.value = prevAccountId;
+      renderAccountPicker();
       toast("切换失败: " + (e.message || e));
+      await refreshLogin(false);
+    } finally {
+      state.authPendingAction = null;
+      releaseLock("switch", lockToken);
+      updateAuthChrome();
     }
+  }
+
+  function restoreWorkspaceSnapshot(snapshot) {
+    if (!snapshot) return;
+    state.eventSince = snapshot.eventSince;
+    state.conversations = (snapshot.conversations || []).slice();
+    state.convMeta = JSON.parse(JSON.stringify(snapshot.convMeta || {}));
+    state.currentUid = snapshot.currentUid || "";
+    state.messages = (snapshot.messages || []).slice();
+    state.orders = snapshot.orders ? JSON.parse(JSON.stringify(snapshot.orders)) : null;
+    state.ordersLoading = snapshot.ordersLoading;
+    state.ordersError = snapshot.ordersError || "";
+    state.contextLoading = snapshot.contextLoading;
+    state.contextError = snapshot.contextError || "";
+    state.listenOn = snapshot.listenOn;
+    state.loggedIn = snapshot.loggedIn;
+    state.loginPhase = snapshot.loginPhase;
+    state.activeAccountId = snapshot.activeAccountId || "";
+    state.accounts = (snapshot.accounts || []).slice();
+    state.convLastSuccess = snapshot.convLastSuccess
+      ? { ...snapshot.convLastSuccess, items: (snapshot.convLastSuccess.items || []).slice() }
+      : null;
+    renderConvList();
+    renderMessages();
+    renderOrders();
+    updateAuthChrome();
   }
 
   async function addAccount() {
@@ -628,73 +860,121 @@
   }
 
   function qrLoginSucceeded(j) {
-    const qr = j.qr || {};
-    if (qr.done || qr.logged_in || qr.phase === "logged_in") return true;
-    if (qr.done && j.logged_in) return true;
-    const cookiesReady = Boolean(j.logged_in || Number(j.cookie_count || 0) > 0);
-    if (!cookiesReady) return false;
-    return ["bootstrapping", "logged_in", "scanned"].includes(qr.phase || "");
+    const ctx = {
+      qrGeneration: state.qrGeneration,
+      currentQrGeneration: state.qrGeneration,
+      qrTargetAccountId: state.qrTargetAccountId,
+      qrTaskId: state.qrTaskId,
+      currentAccountId: state.activeAccountId,
+    };
+    const confirmed = UI().confirmQrLoginSuccess ? UI().confirmQrLoginSuccess(j, ctx) : { ok: false };
+    return confirmed.ok === true;
   }
 
   async function logoutCurrentAccount() {
-    if (!state.loggedIn && !state.activeAccountId) return;
+    if ((!state.loggedIn && !state.activeAccountId) || isLockBusy("logout")) return;
     if (!confirm("确定退出当前店铺吗？退出后该店铺需要重新扫码登录。")) return;
+
+    const lockToken = tryAcquireLock("logout");
+    if (lockToken == null) return;
+
+    const snapshot = UI().createWorkspaceSnapshot ? UI().createWorkspaceSnapshot(state) : null;
     const logoutAid = state.activeAccountId || "";
+    state.authPendingAction = "logging_out";
+    bumpAuthGeneration();
+    updateAuthChrome();
+    _lastLoginRenderKey = "";
+    renderLogin({
+      logged_in: state.loggedIn,
+      qr: { phase: "logging_out", running: true },
+      shop_name: state.lastSession?.shop_name || "当前店铺",
+      onboard: { running: true, phase: "logging_out" },
+    });
+
     try {
       stopQrPoll();
-      resetWorkspaceState();
-      state.listenOn = false;
-      state.loggedIn = false;
-      state.loginPhase = "logged_out";
-      _lastLoginRenderKey = "";
-      updateAuthChrome();
-      renderLogin({ logged_in: false, qr: { phase: "logged_out" }, shop_name: "飞鸽客服" });
-      renderAccountPicker();
-
       const j = await api("/api/accounts/logout", {
         method: "POST",
         body: JSON.stringify({ account_id: logoutAid }),
         trackProgress: true,
       });
-      if (j.ok === false) {
-        toast("退出失败: " + (j.error || "未知错误"));
+      if (lockToken !== actionLocks.logout.token) return;
+      const valid = UI().validateLogoutResult ? UI().validateLogoutResult(j) : { ok: j.ok !== false, error: j.error };
+      if (!valid.ok) {
+        if (snapshot) restoreWorkspaceSnapshot(snapshot);
+        toast("退出失败: " + (valid.error || "未知错误"));
         await refreshLogin(false);
         return;
       }
-      state.activeAccountId = j.active_account_id || j.switched_to || state.activeAccountId;
-      state.loggedIn = Boolean(j.logged_in);
+
+      resetWorkspaceState();
+      state.listenOn = false;
+      state.activeAccountId = valid.activeAccountId || j.active_account_id || j.switched_to || "";
+      state.loggedIn = Boolean(valid.loggedIn);
       state.loginPhase = state.loggedIn ? "logged_in" : "logged_out";
       _lastLoginRenderKey = "";
       await refreshLogin(false);
       if (!state.loggedIn) {
         renderLogin({ logged_in: false, qr: { phase: "logged_out" }, shop_name: "飞鸽客服" });
+      } else {
+        await refreshConversations(true, state.activeCategory || "recent", { heavy: false });
       }
       toast(state.loggedIn ? "已切换至其他已登录店铺" : "已退出，请扫码登录");
     } catch (e) {
+      if (lockToken !== actionLocks.logout.token) return;
+      if (snapshot) restoreWorkspaceSnapshot(snapshot);
       toast("退出失败: " + (e.message || e));
       await refreshLogin(false);
+    } finally {
+      state.authPendingAction = null;
+      releaseLock("logout", lockToken);
+      updateAuthChrome();
     }
   }
 
   async function completeQrLoginSuccess(j) {
+    const ctx = {
+      qrGeneration: state.qrGeneration,
+      currentQrGeneration: state.qrGeneration,
+      qrTargetAccountId: state.qrTargetAccountId,
+      qrTaskId: state.qrTaskId,
+      currentAccountId: state.activeAccountId,
+    };
+    const confirmed = UI().confirmQrLoginSuccess ? UI().confirmQrLoginSuccess(j, ctx) : { ok: false };
+    if (!confirmed.ok) return;
+
     stopQrPoll();
-    const sendOk = j.send_ready === true;
+    bumpAuthGeneration();
+    const sendOk = confirmed.sendReady === true;
     toast(
-      sendOk ? "登录成功，已进入客服工作台" : "登录成功，协议后台预热中，不影响查看会话"
+      sendOk ? "登录成功，已进入客服工作台" : "登录成功，消息通道预热中，不影响查看会话"
     );
     _lastLoginRenderKey = "";
     state.loggedIn = true;
     state.loginPhase = "logged_in";
+    state.authStatus = UI().AUTH_STATUS?.LOGGED_IN || "logged_in";
     await refreshLogin(false);
     await refreshConversations(true, "recent", { heavy: false });
-    if (state.loggedIn) {
-      if (j.listen_ready !== false) await startListening();
+    if (state.loggedIn && j.listen_ready !== false) {
+      await startListening();
     }
   }
 
   function renderLogin(j) {
     const body = $("loginBody");
     if (!body) return;
+    if (state.authStatus === (UI().AUTH_STATUS?.CHECKING || "checking") && !state.qrPollingActive && !state.authLastTrusted) {
+      const viewKey = "checking";
+      if (viewKey === _lastLoginRenderKey) return;
+      _lastLoginRenderKey = viewKey;
+      body.innerHTML = `
+        <p class="status-line"><strong>正在检查登录状态</strong></p>
+        <p class="muted">请稍候，正在连接本地服务…</p>
+        <div class="btn-row">
+          <button type="button" class="btn ghost" disabled>检查中…</button>
+        </div>`;
+      return;
+    }
     if (state.qrPollingActive) {
       j = {
         ...j,
@@ -726,9 +1006,8 @@
         <p class="status-line"><strong>${isExpiredMsg ? "二维码已过期" : "登录失败"}</strong></p>
         <p class="muted">${errText || "请点击下方按钮重新获取"}</p>
         <div class="btn-row">
-          <button type="button" class="btn primary" id="btnRefreshQr">刷新二维码</button>
+          <button type="button" class="btn ghost" id="btnRefreshQr">刷新二维码</button>
         </div>`;
-      $("btnRefreshQr")?.addEventListener("click", startQrLogin);
       return;
     }
 
@@ -778,17 +1057,11 @@
           <button type="button" class="btn ghost warn sm" id="btnLogoutShop">退出当前店铺</button>
           ${fixBtn}
         </div>`;
-      $("btnReQrLogin")?.addEventListener("click", startQrLogin);
-      $("btnLogoutShop")?.addEventListener("click", () => void logoutCurrentAccount());
-      $("btnStartQr")?.addEventListener("click", startQrLogin);
-      $("btnReOnboard")?.addEventListener("click", startCdpOnboard);
-      $("btnWarmInners")?.addEventListener("click", startCdpWarm);
-      $("btnRenewSession")?.addEventListener("click", renewSession);
       return;
     }
 
     const phase = onboard.running ? onboard.phase || "starting" : qr.phase || "logged_out";
-    if (onboard.running && ONBOARD_PHASES[phase]) {
+    if ((onboard.running || state.authPendingAction === "logging_out") && ONBOARD_PHASES[phase]) {
       const [title, sub] = ONBOARD_PHASES[phase];
       const err = phase === "error" ? `<div class="status-err">${onboard.error || "请重试"}</div>` : "";
       body.innerHTML = `
@@ -829,9 +1102,6 @@
         ${CS_MODE ? "" : '<button type="button" class="btn ghost" id="btnStartCdp">浏览器登录（备用）</button>'}
         ${phase === "expired" || phase === "error" || phase === "waiting_scan" || phase === "fetching" ? '<button type="button" class="btn ghost" id="btnRefreshQr">刷新二维码</button>' : ""}
       </div>`;
-    if (!CS_MODE) $("btnStartCdp")?.addEventListener("click", startCdpOnboard);
-    $("btnStartQr")?.addEventListener("click", startQrLogin);
-    $("btnRefreshQr")?.addEventListener("click", startQrLogin);
   }
 
   async function renewSession() {
@@ -954,61 +1224,83 @@
     return false;
   }
   async function startQrLogin() {
+    if (isLockBusy("qr") || isLockBusy("logout") || isLockBusy("switch")) return;
+    const lockToken = tryAcquireLock("qr");
+    if (lockToken == null) return;
+
     stopQrPoll();
+    bumpAuthGeneration();
+    state.qrGeneration += 1;
     _lastLoginRenderKey = "";
     state.loggedIn = false;
     state.qrImgSrc = "";
     state.qrPollingActive = true;
     state.qrStartedAt = Date.now();
     state.loginPhase = "fetching";
+    state.qrTaskId = "";
+    state.qrTargetAccountId = state.activeAccountId || "";
+    state.authStatus = UI().AUTH_STATUS?.LOGGING_IN || "logging_in";
     updateAuthChrome();
     renderLogin({ logged_in: false, qr: { phase: "fetching", running: true } });
-    await waitBridgeReady();
-    const j = await api("/api/qr-login/start", { method: "POST", body: "{}", trackProgress: true });
-    if (j.switched_from) {
-      state.activeAccountId = j.account_id || state.activeAccountId;
-      toast(`已切换到空账号槽 ${j.account_id || ""}，请扫码`);
-    }
-    if (j.ok === false || j.qr?.phase === "error") {
-      state.qrPollingActive = false;
-      toast(j.qr?.error || j.error || "获取二维码失败");
+
+    try {
+      await waitBridgeReady();
+      if (lockToken !== actionLocks.qr.token) return;
+      const j = await api("/api/qr-login/start", { method: "POST", body: "{}", trackProgress: true });
+      if (lockToken !== actionLocks.qr.token) return;
+      if (j.switched_from) {
+        state.activeAccountId = j.account_id || state.activeAccountId;
+        state.qrTargetAccountId = state.activeAccountId;
+        toast(`已切换到空账号槽 ${j.account_id || ""}，请扫码`);
+      }
+      if (j.ok === false || j.qr?.phase === "error") {
+        state.qrPollingActive = false;
+        toast(j.qr?.error || j.error || "获取二维码失败");
+        _lastLoginRenderKey = "";
+        renderLogin({ logged_in: false, qr: j.qr || { phase: "error", error: j.error || "获取二维码失败" } });
+        return;
+      }
+      state.qrTaskId = String(j.qr?.job_id || j.job_id || "");
+      if (j.qrcode_b64) {
+        state.qrImgSrc = "data:image/png;base64," + j.qrcode_b64;
+      }
+      scheduleQrImgRefresh();
       _lastLoginRenderKey = "";
-      renderLogin({ logged_in: false, qr: j.qr || { phase: "error", error: j.error || "获取二维码失败" } });
-      return;
-    }
-    if (j.qrcode_b64) {
-      state.qrImgSrc = "data:image/png;base64," + j.qrcode_b64;
-    }
-    scheduleQrImgRefresh();
-    _lastLoginRenderKey = "";
-    const phase = j.qr?.phase === "fetching" ? "fetching" : "waiting_scan";
-    state.loginPhase = phase;
-    renderLogin({
-      logged_in: false,
-      qr: { ...(j.qr || {}), phase, running: true },
-    });
-    const img = document.querySelector(".qr-box img");
-    if (img) img.src = qrImgSrc();
-    if (phase === "fetching") {
-      setTimeout(() => {
-        if (state.qrPollingActive) pollQrStatus();
-      }, 800);
-    } else {
-      pollQrStatus();
+      const phase = j.qr?.phase === "fetching" ? "fetching" : "waiting_scan";
+      state.loginPhase = phase;
+      renderLogin({
+        logged_in: false,
+        qr: { ...(j.qr || {}), phase, running: true, job_id: state.qrTaskId },
+      });
+      const img = document.querySelector(".qr-box img");
+      if (img) img.src = qrImgSrc();
+      if (phase === "fetching") {
+        setTimeout(() => {
+          if (state.qrPollingActive && lockToken === actionLocks.qr.token) pollQrStatus(state.qrGeneration, lockToken);
+        }, 800);
+      } else {
+        pollQrStatus(state.qrGeneration, lockToken);
+      }
+    } finally {
+      releaseLock("qr", lockToken);
     }
   }
 
-  async function pollQrStatus() {
+  async function pollQrStatus(qrGen, qrLockToken) {
     const gen = ++_qrPollGen;
     const tick = async () => {
-      if (gen !== _qrPollGen) return;
+      if (gen !== _qrPollGen || qrGen !== state.qrGeneration) return;
       const j = await api("/api/qr-login/status", BG_API);
-      if (gen !== _qrPollGen) return;
+      if (gen !== _qrPollGen || qrGen !== state.qrGeneration) return;
+      const qr = j.qr || {};
+      if (qr.phase === "scanned") state.loginPhase = "scanned";
+      if (qr.phase === "bootstrapping") state.loginPhase = "bootstrapping";
+      if (qr.phase === "waiting_scan") state.loginPhase = "waiting_scan";
+
       if (j.ok === false && state.qrPollingActive && Date.now() - state.qrStartedAt < 10 * 60 * 1000) {
         setTimeout(tick, 1500);
         return;
       }
-      const qr = j.qr || {};
       if (qr.qr_refreshed_at && qr.qr_refreshed_at !== state.lastQrRefreshAt) {
         state.lastQrRefreshAt = qr.qr_refreshed_at;
         const img = document.querySelector(".qr-box img");
@@ -1058,16 +1350,12 @@
         return;
       }
       state.loggedIn = effectiveLoggedIn(j);
-      syncLoginState(j);
+      syncLoginState(j, { trust: false });
       if (state.qrPollingActive && qrLoginSucceeded(j)) {
         await completeQrLoginSuccess(j);
         return;
       }
       renderLogin(j);
-      if (j.logged_in && (qr.done || qr.phase === "logged_in" || qr.phase === "bootstrapping")) {
-        await completeQrLoginSuccess(j);
-        return;
-      }
       if (j.qr?.phase === "bootstrapping") {
         if (qrLoginSucceeded(j)) {
           await completeQrLoginSuccess(j);
@@ -1095,22 +1383,9 @@
         setTimeout(tick, 1200);
         return;
       }
-      if (j.logged_in && !isQrFlowActive(j)) {
+      if (j.logged_in && qrLoginSucceeded(j) && !isQrFlowActive(j)) {
         stopQrPoll();
-        const sendOk = j.send_ready !== false;
-        const post = j.post_login || {};
-        toast(
-          sendOk
-            ? "登录成功，发信已就绪"
-            : post.rust_sdk?.ingested
-              ? "登录成功，发信已就绪"
-              : "登录成功（发信预热中，可先监听）"
-        );
-        if (j.blockers?.length && !sendOk) {
-          toast(j.blockers[0], 6000);
-        }
-        _lastLoginRenderKey = "";
-        await refreshLogin();
+        await completeQrLoginSuccess(j);
         return;
       }
       if (!isQrFlowActive(j)) {
@@ -1226,76 +1501,160 @@
   }
 
   async function enrichConvDisplayNames() {
+    const accountGen = state.accountGeneration;
+    const accountId = state.activeAccountId;
     const pending = (state.conversations || []).filter((c) => {
       const uid = String(c.security_user_id || "");
-      return uid && isUidFallbackName(convName(c), uid);
+      if (!uid || isUidFallbackName(convName(c), uid) === false) return false;
+      if (state.enrichInFlight.has(uid)) return false;
+      const failedAt = Number(state.enrichFailedAt[uid] || 0);
+      if (failedAt && Date.now() - failedAt < 5 * 60 * 1000) return false;
+      return true;
     });
     if (!pending.length) return;
     for (const c of pending.slice(0, 5)) {
+      if (accountGen !== state.accountGeneration || accountId !== state.activeAccountId) return;
       const uid = c.security_user_id;
+      state.enrichInFlight.add(uid);
       try {
         const j = await api(`/api/context?user_id=${encodeURIComponent(uid)}`, {
           ...BG_API,
           timeoutMs: 5000,
         });
+        if (accountGen !== state.accountGeneration || accountId !== state.activeAccountId) return;
         const ctx = j.context || {};
         const name = cleanBuyerName(ctx.buyer_name);
-        if (!name || isUidFallbackName(name, uid)) continue;
+        if (!name || isUidFallbackName(name, uid)) {
+          state.enrichFailedAt[uid] = Date.now();
+          continue;
+        }
         const meta = state.convMeta[uid] || {};
         meta.buyerName = name;
         state.convMeta[uid] = meta;
         c.display_name = name;
         c.buyer_name = name;
         c.name = name;
+        const itemEl = document.querySelector(`.conv-item[data-uid="${CSS.escape(uid)}"] .name`);
+        if (itemEl) itemEl.textContent = name;
       } catch {
-        /* skip single buyer name enrich failure */
+        state.enrichFailedAt[uid] = Date.now();
+      } finally {
+        state.enrichInFlight.delete(uid);
       }
     }
-    renderConvList();
-    updateBuyerMeta(state.currentUid);
+    if (state.currentUid) updateBuyerMeta(state.currentUid);
+  }
+
+  function renderConvListRefreshingIndicator(show) {
+    const countEl = $("convCount");
+    if (!countEl) return;
+    if (show) countEl.classList.add("is-refreshing");
+    else countEl.classList.remove("is-refreshing");
   }
 
   async function refreshConversations(showProgress = false, category, { heavy = false } = {}) {
     const cat = category || state.activeCategory;
     if (!isActiveAccountLoggedIn()) {
       state.conversations = [];
+      state.convListStatus = "idle";
       renderConvList();
       return;
     }
-    $("convList").innerHTML = `<div class="skeleton-stack pad"><div class="skeleton line"></div><div class="skeleton line w70"></div></div>`;
+
+    const requestId = ++state.convListRequestId;
+    const accountGen = state.accountGeneration;
+    const accountId = state.activeAccountId;
+    const userInitiated = Boolean(showProgress);
+    const hasExisting = (state.conversations || []).length > 0 || Boolean(state.convLastSuccess?.items?.length);
+
+    if (userInitiated || !hasExisting) {
+      state.convListStatus = "loading";
+      $("convList").innerHTML = `<div class="skeleton-stack pad"><div class="skeleton line"></div><div class="skeleton line w70"></div></div>`;
+    } else {
+      state.convListStatus = "refreshing";
+      renderConvListRefreshingIndicator(true);
+    }
+
+    if (_convAbortController) _convAbortController.abort();
+    _convAbortController = new AbortController();
+    const signal = _convAbortController.signal;
+
     try {
       const qs = new URLSearchParams({ page: "0", size: "50" });
       const apiCategory = convCategoryParam(cat);
       if (apiCategory) qs.set("category", apiCategory);
       if (!heavy) qs.set("light", "1");
-      const j = await api(
-        `/api/conversations?${qs}`,
-        {
-          ...(showProgress ? { trackProgress: true } : BG_API),
-          timeoutMs: heavy ? 8000 : 5000,
+      const j = await api(`/api/conversations?${qs}`, {
+        ...(userInitiated ? { trackProgress: true } : BG_API),
+        timeoutMs: heavy ? 8000 : 5000,
+        signal,
+      });
+
+      const resolved = UI().resolveConvRefreshResult
+        ? UI().resolveConvRefreshResult(j, {
+            requestId,
+            latestRequestId: state.convListRequestId,
+            accountGeneration: accountGen,
+            snapshotAccountGeneration: state.accountGeneration,
+            category: cat,
+            snapshotCategory: state.activeCategory,
+            userInitiated,
+          })
+        : { apply: requestId === state.convListRequestId, items: j.items || [], keepPrevious: j.timeout };
+
+      if (!resolved.apply) {
+        if (resolved.keepPrevious && state.convLastSuccess?.items?.length) {
+          state.conversations = state.convLastSuccess.items.slice();
         }
-      );
-      if (!j.ok && !(j.items || []).length && !j.timeout && showProgress) {
-        toast((j.raw && j.raw.error) || j.error || "会话列表拉取失败，可点刷新重试");
+        if (resolved.showDegraded && !userInitiated) {
+          toast("会话列表后台刷新超时，已保留上次数据", 3000);
+        } else if (resolved.showError) {
+          toast((j.raw && j.raw.error) || j.error || "会话列表拉取失败，已保留上次数据");
+        }
+        state.convListStatus = state.conversations.length ? "ready" : "error";
+        renderConvList();
+        return;
       }
-      state.conversations = j.items || [];
+
+      state.conversations = resolved.items || [];
+      state.convLastSuccess = {
+        items: state.conversations.slice(),
+        accountId,
+        category: cat,
+        at: Date.now(),
+        accountGeneration: accountGen,
+      };
       const via = (j.raw && j.raw.via) || j.via || "";
-      if (state.conversations.length === 0 && j.ok !== false) {
+      if (state.conversations.length === 0 && j.ok !== false && resolved.explicitEmpty) {
         if (/fallback/.test(via)) {
           toast("工作台接口暂无会话，已从本地缓存加载联系人", 5000);
-        } else if (showProgress) {
+        } else if (userInitiated) {
           toast("暂无最近联系人（店铺当前没有待处理会话）", 4000);
         }
       }
     } catch (e) {
-      if (showProgress) toast("无法拉取会话: " + (e.message || e));
-      state.conversations = [];
+      if (requestId !== state.convListRequestId || accountGen !== state.accountGeneration) return;
+      if (userInitiated) toast("无法拉取会话: " + (e.message || e));
+      if (state.convLastSuccess?.items?.length && state.convLastSuccess.accountId === accountId) {
+        state.conversations = state.convLastSuccess.items.slice();
+      } else if (userInitiated) {
+        state.conversations = [];
+      }
+      state.convListStatus = state.conversations.length ? "ready" : "error";
+    } finally {
+      if (requestId === state.convListRequestId) {
+        renderConvListRefreshingIndicator(false);
+      }
     }
+
+    if (requestId !== state.convListRequestId || accountGen !== state.accountGeneration) return;
+
     state.conversations.forEach((c) => {
       const uid = c.security_user_id;
       if (!uid) return;
       if (!state.convMeta[uid]) state.convMeta[uid] = { aiStatus: "wait" };
     });
+    state.convListStatus = "ready";
     renderConvList();
     void enrichConvDisplayNames();
     if (!state.currentUid && state.conversations[0]?.security_user_id) {
@@ -1320,6 +1679,7 @@
 
   async function loadConversationContext(uid, selectSeq) {
     const loadGen = ++_contextLoadGen;
+    const accountGen = state.accountGeneration;
     state.contextLoading = true;
     state.contextError = "";
     renderMessages();
@@ -1330,6 +1690,18 @@
     });
 
     if (selectSeq !== _selectReqSeq || uid !== state.currentUid || loadGen !== _contextLoadGen) {
+      return;
+    }
+    if (!UI().shouldApplyConversationData({
+      selectSeq,
+      currentSelectSeq: _selectReqSeq,
+      uid,
+      currentUid: state.currentUid,
+      loadGen,
+      currentLoadGen: _contextLoadGen,
+      accountGeneration: accountGen,
+      currentAccountGeneration: state.accountGeneration,
+    })) {
       return;
     }
 
@@ -1371,6 +1743,7 @@
 
   async function loadConversationOrders(uid, selectSeq, { heavy = false } = {}) {
     const loadGen = ++_ordersLoadGen;
+    const accountGen = state.accountGeneration;
     state.ordersLoading = true;
     state.ordersError = "";
     renderOrders();
@@ -1385,6 +1758,18 @@
     });
 
     if (selectSeq !== _selectReqSeq || uid !== state.currentUid || loadGen !== _ordersLoadGen) {
+      return;
+    }
+    if (!UI().shouldApplyConversationData({
+      selectSeq,
+      currentSelectSeq: _selectReqSeq,
+      uid,
+      currentUid: state.currentUid,
+      loadGen,
+      currentLoadGen: _ordersLoadGen,
+      accountGeneration: accountGen,
+      currentAccountGeneration: state.accountGeneration,
+    })) {
       return;
     }
 
@@ -1796,67 +2181,88 @@
     return window.innerWidth <= 1100;
   }
 
-  function defaultOrdersPanelOpen() {
-    return window.innerWidth > 1100;
+  function setOrdersPanelOpen(open, { source = "auto" } = {}) {
+    const wide = window.innerWidth > 1100;
+    if (wide) {
+      if (source === "user") state.desktopOrdersPrefOpen = open;
+      state.ordersDrawerOpen = false;
+    } else {
+      state.ordersDrawerOpen = open;
+    }
+    applyOrdersPanelLayout();
   }
 
-  function setOrdersPanelOpen(open) {
-    state.ordersPanelOpen = open;
+  function applyOrdersPanelLayout() {
+    const wide = window.innerWidth > 1100;
+    const panelOpen = wide ? state.desktopOrdersPrefOpen : state.ordersDrawerOpen;
     const ws = document.querySelector(".workspace");
     const drawer = $("orderDrawer");
     const backdrop = $("drawerBackdrop");
-    if (useOrderDrawer()) {
-      ws?.classList.remove("orders-collapsed");
-      drawer?.classList.toggle("is-open", open);
-      backdrop?.classList.toggle("is-open", open);
-      if (drawer) drawer.hidden = !open;
-      if (backdrop) backdrop.hidden = !open;
-    } else {
-      ws?.classList.toggle("orders-collapsed", !open);
+    if (wide) {
+      ws?.classList.toggle("orders-collapsed", !panelOpen);
       drawer?.classList.remove("is-open");
       backdrop?.classList.remove("is-open");
       if (drawer) drawer.hidden = true;
       if (backdrop) backdrop.hidden = true;
+    } else {
+      ws?.classList.remove("orders-collapsed");
+      drawer?.classList.toggle("is-open", panelOpen);
+      backdrop?.classList.toggle("is-open", panelOpen);
+      if (drawer) drawer.hidden = !panelOpen;
+      if (backdrop) backdrop.hidden = !panelOpen;
     }
   }
 
   function syncOrdersPanelLayout() {
     const wide = window.innerWidth > 1100;
-    if (wide !== _ordersWideLayout) {
-      setOrdersPanelOpen(wide ? true : false);
-      _ordersWideLayout = wide;
-      return;
-    }
-    setOrdersPanelOpen(state.ordersPanelOpen);
+    const layout = UI().syncOrdersLayout
+      ? UI().syncOrdersLayout({
+          wide,
+          prevWide: _ordersWideLayout,
+          desktopPrefOpen: state.desktopOrdersPrefOpen,
+          drawerOpen: state.ordersDrawerOpen,
+        })
+      : { desktopPrefOpen: state.desktopOrdersPrefOpen, drawerOpen: false, panelOpen: wide ? state.desktopOrdersPrefOpen : false, wide };
+    state.desktopOrdersPrefOpen = layout.desktopPrefOpen;
+    state.ordersDrawerOpen = layout.drawerOpen;
+    _ordersWideLayout = layout.wide;
+    applyOrdersPanelLayout();
   }
 
   function closeOrdersPanel() {
-    setOrdersPanelOpen(false);
+    setOrdersPanelOpen(false, { source: useOrderDrawer() ? "user" : "user" });
   }
 
   function toggleOrdersPanel() {
-    setOrdersPanelOpen(!state.ordersPanelOpen);
+    if (!state.loggedIn) {
+      toast("请先登录店铺后再查看订单");
+      return;
+    }
+    const wide = window.innerWidth > 1100;
+    const next = wide ? !state.desktopOrdersPrefOpen : !state.ordersDrawerOpen;
+    setOrdersPanelOpen(next, { source: "user" });
   }
 
   function bindEvents() {
     $("loginBody")?.addEventListener("click", (e) => {
       const btn = e.target.closest("button");
       if (!btn || !btn.id) return;
-      if (btn.id === "btnStartQr" || btn.id === "btnRefreshQr" || btn.id === "btnReQrLogin") {
-        e.preventDefault();
+      const action = UI().loginBodyDelegatedAction
+        ? UI().loginBodyDelegatedAction(btn.id)
+        : null;
+      if (!action) return;
+      e.preventDefault();
+      if (action === "start_qr" || action === "refresh_qr") {
+        if (isLockBusy("qr")) return;
         void startQrLogin();
-      } else if (btn.id === "btnStartCdp") {
-        e.preventDefault();
+      } else if (action === "start_cdp") {
         void startCdpOnboard();
-      } else if (btn.id === "btnReOnboard") {
-        e.preventDefault();
-        void startCdpOnboard();
-      } else if (btn.id === "btnRenewSession") {
-        e.preventDefault();
+      } else if (action === "renew_session") {
         void renewSession();
-      } else if (btn.id === "btnWarmInners") {
-        e.preventDefault();
+      } else if (action === "warm_inners") {
         void startCdpWarm();
+      } else if (action === "logout") {
+        void logoutCurrentAccount();
       }
     });
 
@@ -1873,6 +2279,10 @@
     $("btnLogoutAccount")?.addEventListener("click", () => void logoutCurrentAccount());
     $("accountSelect")?.addEventListener("change", (e) => {
       const id = e.target.value;
+      if (isLockBusy("logout") || isLockBusy("switch")) {
+        e.target.value = state.activeAccountId || "";
+        return;
+      }
       if (!id) {
         renderAccountPicker();
         void startQrLogin();
@@ -1908,7 +2318,9 @@
       }
     });
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && state.ordersPanelOpen) {
+      const wide = window.innerWidth > 1100;
+      const drawerOpen = !wide && state.ordersDrawerOpen;
+      if (e.key === "Escape" && drawerOpen) {
         closeOrdersPanel();
       }
     });
@@ -1960,8 +2372,10 @@
       $("globalProgress")?.classList.remove("done");
       if ($("globalProgress")) $("globalProgress").hidden = true;
       _ordersWideLayout = window.innerWidth > 1100;
-      setOrdersPanelOpen(defaultOrdersPanelOpen());
+      state.desktopOrdersPrefOpen = _ordersWideLayout;
+      syncOrdersPanelLayout();
       window.addEventListener("resize", syncOrdersPanelLayout);
+      state.authStatus = UI().AUTH_STATUS?.CHECKING || "checking";
       updateAuthChrome();
       renderConvTabs();
       setConn(true, "连接中…");
