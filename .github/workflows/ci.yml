@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install Node deps
+        run: npm install
+
+      - name: JS syntax check
+        run: |
+          node --check desktop/ui/app-state.js
+          node --check desktop/ui/app.js
+
+      - name: Node UI tests
+        run: |
+          node tests/test_ui_state.mjs
+          node tests/test_ui_integration.mjs
+
+      - name: Python tests
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m pip install --upgrade pip
+          python -m pytest
+          python scripts/test_conversation_name_parse.py
+
+      - name: Go tests
+        working-directory: desktop/pigeon-feige
+        run: go test ./...

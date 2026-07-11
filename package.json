@@ -4,7 +4,8 @@
   "description": "抖店飞鸽 **纯协议** 实验项目，与 `douyin-customer-assistant` / `doudian-cdp` **完全独立**。",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test:ui": "node tests/test_ui_state.mjs && node tests/test_ui_integration.mjs",
+    "test": "npm run test:ui"
   },
   "keywords": [],
   "author": "",

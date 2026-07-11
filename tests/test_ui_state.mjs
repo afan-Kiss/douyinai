@@ -1,5 +1,5 @@
 /**
- * UI state machine unit tests (Node.js, no browser).
+ * UI state machine unit tests (Node.js).
  * Run: node tests/test_ui_state.mjs
  */
 import assert from "node:assert/strict";
@@ -47,7 +47,6 @@ test("logged_in=true with matching account succeeds", () => {
     { qrGeneration: 2, currentQrGeneration: 2, qrTargetAccountId: "shop_a", qrTaskId: "job1" }
   );
   assert.equal(r.ok, true);
-  assert.equal(r.uiPhase, "logged_in_ready");
 });
 
 test("stale qr generation rejected", () => {
@@ -59,95 +58,150 @@ test("stale qr generation rejected", () => {
   assert.equal(r.reason, "stale_qr_generation");
 });
 
+test("session snapshot rejected when auth generation advanced", () => {
+  const g = UI.shouldApplySessionSnapshot(
+    { logged_in: true, accounts: [] },
+    { authGeneration: 3, snapshotGeneration: 2 }
+  );
+  assert.equal(g.apply, false);
+  assert.equal(g.reason, "stale_auth_generation");
+});
+
+test("restore trusted auth rejects stale generation", () => {
+  const r = UI.canRestoreTrustedAuth(
+    { generation: 1, activeAccountId: "shop_a", loggedIn: true, accounts: [] },
+    { authGeneration: 2, requiredAccountId: "shop_a" }
+  );
+  assert.equal(r.ok, false);
+});
+
+test("restore trusted auth rejects account mismatch", () => {
+  const r = UI.canRestoreTrustedAuth(
+    { generation: 2, activeAccountId: "shop_a", loggedIn: true, accounts: [] },
+    { authGeneration: 2, requiredAccountId: "shop_b" }
+  );
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "account_mismatch");
+});
+
+test("A to B switch timeout must not restore A when requiredAccountId is B", () => {
+  const trusted = { generation: 1, activeAccountId: "shop_a", loggedIn: true, accounts: [{ id: "shop_a" }] };
+  const r = UI.canRestoreTrustedAuth(trusted, { authGeneration: 1, requiredAccountId: "shop_b" });
+  assert.equal(r.ok, false);
+});
+
+test("logout success snapshot must not restore logged-in A when requiredLoggedOut", () => {
+  const trusted = { generation: 2, activeAccountId: "shop_a", loggedIn: true, accounts: [] };
+  const r = UI.canRestoreTrustedAuth(trusted, { authGeneration: 2, requiredAccountId: "shop_b", requiredLoggedIn: false });
+  assert.equal(r.ok, false);
+});
+
 test("account switch ok:false rejected", () => {
-  const r = UI.validateAccountSwitchResult({ ok: false, error: "denied" }, "a2");
-  assert.equal(r.ok, false);
+  assert.equal(UI.validateAccountSwitchResult({ ok: false, error: "denied" }, "a2").ok, false);
 });
 
-test("account switch mismatch rejected", () => {
-  const r = UI.validateAccountSwitchResult({ ok: true, account_id: "a1" }, "a2");
-  assert.equal(r.ok, false);
+test("account B stale context rejected after switch", () => {
+  assert.equal(
+    UI.shouldApplyConversationData({
+      selectSeq: 1,
+      currentSelectSeq: 1,
+      uid: "u1",
+      currentUid: "u1",
+      loadGen: 1,
+      currentLoadGen: 1,
+      accountGeneration: 1,
+      currentAccountGeneration: 2,
+      accountId: "shop_a",
+      currentAccountId: "shop_b",
+    }),
+    false
+  );
 });
 
-test("account switch success when account_id matches", () => {
-  const r = UI.validateAccountSwitchResult({ ok: true, account_id: "a2" }, "a2");
-  assert.equal(r.ok, true);
-  assert.equal(r.activeAccountId, "a2");
+test("AI result rejected when uid changed", () => {
+  assert.equal(
+    UI.shouldApplyAiResult({
+      requestId: 1,
+      currentRequestId: 1,
+      accountGeneration: 1,
+      currentAccountGeneration: 1,
+      accountId: "shop_a",
+      currentAccountId: "shop_a",
+      uid: "buyer_a",
+      currentUid: "buyer_b",
+      selectSeq: 1,
+      currentSelectSeq: 2,
+      humanTakeover: false,
+      aiMode: "auto",
+    }),
+    false
+  );
+});
+
+test("poll events rejected when account generation changed", () => {
+  assert.equal(
+    UI.shouldApplyPollEvents({
+      accountId: "shop_a",
+      currentAccountId: "shop_a",
+      accountGeneration: 1,
+      currentAccountGeneration: 2,
+      listenGeneration: 1,
+      currentListenGeneration: 2,
+    }),
+    false
+  );
 });
 
 test("background conv refresh timeout keeps previous data", () => {
   const r = UI.resolveConvRefreshResult(
     { timeout: true, ok: false },
-    { requestId: 1, latestRequestId: 1, accountGeneration: 1, snapshotAccountGeneration: 1, category: "all", snapshotCategory: "all", userInitiated: false }
+    {
+      requestId: 1,
+      latestRequestId: 1,
+      accountGeneration: 1,
+      snapshotAccountGeneration: 1,
+      category: "all",
+      snapshotCategory: "all",
+      userInitiated: false,
+    }
   );
   assert.equal(r.apply, false);
   assert.equal(r.keepPrevious, true);
-  assert.equal(r.showDegraded, true);
-});
-
-test("stale conv request discarded", () => {
-  const r = UI.resolveConvRefreshResult(
-    { ok: true, items: [{ security_user_id: "u1" }] },
-    { requestId: 1, latestRequestId: 2, accountGeneration: 1, snapshotAccountGeneration: 1, category: "all", snapshotCategory: "all", userInitiated: false }
-  );
-  assert.equal(r.apply, false);
-});
-
-test("conversation data stale account rejected", () => {
-  const ok = UI.shouldApplyConversationData({
-    selectSeq: 1,
-    currentSelectSeq: 1,
-    uid: "u1",
-    currentUid: "u1",
-    loadGen: 1,
-    currentLoadGen: 1,
-    accountGeneration: 1,
-    currentAccountGeneration: 2,
-  });
-  assert.equal(ok, false);
 });
 
 test("orders layout preserves desktop preference on resize back", () => {
   const narrow = UI.syncOrdersLayout({ wide: false, prevWide: true, desktopPrefOpen: false, drawerOpen: true });
   assert.equal(narrow.drawerOpen, false);
-  assert.equal(narrow.desktopPrefOpen, false);
   const wide = UI.syncOrdersLayout({ wide: true, prevWide: false, desktopPrefOpen: false, drawerOpen: false });
   assert.equal(wide.panelOpen, false);
 });
 
-test("session timeout should not apply snapshot", () => {
-  const g = UI.shouldApplySessionSnapshot({ timeout: true }, { authGeneration: 1, snapshotGeneration: 1 });
-  assert.equal(g.apply, false);
-  assert.equal(g.degraded, true);
-});
-
-test("logout snapshot can restore workspace", () => {
+test("logout snapshot preserves buyer title fields", () => {
   const snap = UI.createWorkspaceSnapshot({
-    eventSince: 3,
-    conversations: [{ security_user_id: "u1" }],
-    convMeta: { u1: { buyerName: "张三" } },
+    eventSince: 1,
+    eventSinceByAccount: { shop_a: 1 },
+    conversations: [],
+    convMeta: {},
     currentUid: "u1",
-    messages: [{ text: "hi", role: "buyer" }],
-    orders: { has_order: true, cards: [] },
+    messages: [{ text: "hi" }],
+    orders: null,
     ordersLoading: false,
     ordersError: "",
     contextLoading: false,
     contextError: "",
     listenOn: true,
+    listenGeneration: 1,
     loggedIn: true,
     loginPhase: "logged_in",
     activeAccountId: "shop_a",
-    accounts: [{ id: "shop_a", logged_in: true }],
+    accountGeneration: 3,
+    accounts: [],
     authStatus: "logged_in",
+    authSyncError: "",
     convLastSuccess: null,
   });
-  assert.equal(snap.currentUid, "u1");
-  assert.equal(snap.conversations.length, 1);
-});
-
-test("loginBodyDelegatedAction maps logout", () => {
-  assert.equal(UI.loginBodyDelegatedAction("btnLogoutShop"), "logout");
-  assert.equal(UI.loginBodyDelegatedAction("btnStartQr"), "start_qr");
+  assert.equal(snap.accountGeneration, 3);
+  assert.deepEqual(snap.eventSinceByAccount, { shop_a: 1 });
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

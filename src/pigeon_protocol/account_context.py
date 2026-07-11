@@ -644,9 +644,10 @@ def register_account_from_session(session, *, set_active: bool = False, source_a
     shop = infer_shop_id_from_session(session) or str(getattr(session, "shop_id", "") or cookies.get("SHOP_ID") or "")
     sid = str(cookies.get("sessionid") or cookies.get("sid_tt") or "")
     src = str(source_account_id or active_account_id() or "").strip()
-    if shop and src and src != derive_account_id(shop_id=shop):
+    canonical = derive_account_id(shop_id=shop, sessionid=sid)
+    if shop and src and src != canonical and set_active:
         return promote_account_to_shop(src, shop)
-    aid = derive_account_id(shop_id=shop, sessionid=sid)
+    aid = canonical
     from pigeon_protocol.shop_profile import cached_shop_name, is_placeholder_shop_label
 
     name = cached_shop_name(session)

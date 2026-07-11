@@ -41,7 +41,6 @@
     return isQrFlowPhase(qr.phase);
   }
 
-  /** Strict QR login success — never trust qr.done alone. */
   function confirmQrLoginSuccess(j, ctx) {
     const c = ctx || {};
     if (!j || j.logged_in !== true) {
@@ -80,34 +79,6 @@
     return { ok: true, reason: "confirmed", uiPhase, activeId, sendReady, listenReady };
   }
 
-  /** Map backend payload to auth UI phase label. */
-  function deriveAuthUiPhase(j, ctx) {
-    const c = ctx || {};
-    if (c.pendingAction === "logging_out") return "logging_out";
-    if (c.pendingAction === "switching") return "switching";
-    if (c.qrPollingActive) {
-      const qp = c.loginPhase || j?.qr?.phase || "fetching";
-      if (qp === "fetching") return "fetching_qr";
-      if (qp === "waiting_scan") return "waiting_scan";
-      if (qp === "scanned") return "scanned_confirm";
-      if (qp === "bootstrapping") return "writing_session";
-      return "logging_in";
-    }
-    const qr = (j && j.qr) || {};
-    if (qr.phase === "expired") return "qr_expired";
-    if (qr.phase === "error") return "login_failed";
-    if (effectiveLoggedIn(j)) {
-      const confirmed = confirmQrLoginSuccess(j, c);
-      if (confirmed.ok) {
-        return confirmed.uiPhase === "logged_in_warming" ? "logged_in_warming" : "logged_in_ready";
-      }
-      if (confirmed.uiPhase === "writing_session") return "writing_session";
-      if (c.authStatus === AUTH_STATUS.DEGRADED) return "degraded";
-      return effectiveLoggedIn(j) ? "logged_in_ready" : "logged_out";
-    }
-    return "logged_out";
-  }
-
   function shouldApplySessionSnapshot(j, ctx) {
     const c = ctx || {};
     if (!j) return { apply: false, reason: "empty" };
@@ -119,6 +90,25 @@
       return { apply: false, reason: "stale_auth_generation" };
     }
     return { apply: true, reason: "ok" };
+  }
+
+  function canRestoreTrustedAuth(trusted, ctx) {
+    const c = ctx || {};
+    const t = trusted;
+    if (!t) return { ok: false, reason: "empty" };
+    if (c.authGeneration != null && t.generation != null && t.generation !== c.authGeneration) {
+      return { ok: false, reason: "stale_auth_generation" };
+    }
+    if (c.requiredAccountId != null && String(t.activeAccountId || "") !== String(c.requiredAccountId || "")) {
+      return { ok: false, reason: "account_mismatch" };
+    }
+    if (c.requiredLoggedIn === true && !t.loggedIn) {
+      return { ok: false, reason: "logged_out_snapshot" };
+    }
+    if (c.requiredLoggedIn === false && t.loggedIn) {
+      return { ok: false, reason: "logged_in_snapshot" };
+    }
+    return { ok: true, reason: "ok" };
   }
 
   function validateAccountSwitchResult(j, targetAccountId) {
@@ -150,8 +140,11 @@
     if (c.requestId != null && c.latestRequestId != null && c.requestId !== c.latestRequestId) {
       return { replace: false, reason: "stale_request" };
     }
-    if (c.accountGeneration != null && c.snapshotAccountGeneration != null &&
-        c.accountGeneration !== c.snapshotAccountGeneration) {
+    if (
+      c.accountGeneration != null &&
+      c.snapshotAccountGeneration != null &&
+      c.accountGeneration !== c.snapshotAccountGeneration
+    ) {
       return { replace: false, reason: "stale_account" };
     }
     if (c.category != null && c.snapshotCategory != null && c.category !== c.snapshotCategory) {
@@ -181,9 +174,38 @@
     const c = ctx || {};
     if (c.selectSeq !== c.currentSelectSeq) return false;
     if (c.uid !== c.currentUid) return false;
-    if (c.loadGen !== c.currentLoadGen) return false;
+    if (c.loadGen != null && c.currentLoadGen != null && c.loadGen !== c.currentLoadGen) return false;
     if (c.accountGeneration !== c.currentAccountGeneration) return false;
+    if (c.accountId != null && c.currentAccountId != null && c.accountId !== c.currentAccountId) return false;
     return true;
+  }
+
+  function shouldApplyAiResult(ctx) {
+    const c = ctx || {};
+    if (c.requestId != null && c.currentRequestId != null && c.requestId !== c.currentRequestId) return false;
+    if (c.accountGeneration !== c.currentAccountGeneration) return false;
+    if (c.accountId !== c.currentAccountId) return false;
+    if (c.uid !== c.currentUid) return false;
+    if (c.selectSeq !== c.currentSelectSeq) return false;
+    if (c.humanTakeover) return false;
+    if (c.aiMode === "pause") return false;
+    return true;
+  }
+
+  function shouldApplySendResult(ctx) {
+    return shouldApplyAiResult(ctx);
+  }
+
+  function shouldApplyPollEvents(ctx) {
+    const c = ctx || {};
+    if (c.accountId !== c.currentAccountId) return false;
+    if (c.accountGeneration !== c.currentAccountGeneration) return false;
+    if (c.listenGeneration !== c.currentListenGeneration) return false;
+    return true;
+  }
+
+  function aiDraftKey(accountId, uid) {
+    return `${String(accountId || "")}:${String(uid || "")}`;
   }
 
   function syncOrdersLayout(ctx) {
@@ -208,6 +230,7 @@
   function createWorkspaceSnapshot(state) {
     return {
       eventSince: state.eventSince,
+      eventSinceByAccount: { ...(state.eventSinceByAccount || {}) },
       conversations: (state.conversations || []).slice(),
       convMeta: JSON.parse(JSON.stringify(state.convMeta || {})),
       currentUid: state.currentUid || "",
@@ -218,13 +241,26 @@
       contextLoading: state.contextLoading,
       contextError: state.contextError || "",
       listenOn: state.listenOn,
+      listenGeneration: state.listenGeneration || 0,
       loggedIn: state.loggedIn,
       loginPhase: state.loginPhase,
       activeAccountId: state.activeAccountId || "",
+      accountGeneration: state.accountGeneration || 0,
       accounts: (state.accounts || []).slice(),
       accountSelectValue: state.activeAccountId || "",
       authStatus: state.authStatus,
-      convLastSuccess: state.convLastSuccess ? { ...state.convLastSuccess, items: (state.convLastSuccess.items || []).slice() } : null,
+      authSyncError: state.authSyncError || "",
+      aiDraft: state.aiDraft || "",
+      aiIntent: state.aiIntent || "",
+      aiState: state.aiState || "idle",
+      composerValue: state.composerValue || "",
+      humanTakeover: state.humanTakeover,
+      buyerTitle: state.buyerTitle || "",
+      buyerAvatar: state.buyerAvatar || "",
+      buyerMeta: state.buyerMeta || "",
+      convLastSuccess: state.convLastSuccess
+        ? { ...state.convLastSuccess, items: (state.convLastSuccess.items || []).slice() }
+        : null,
     };
   }
 
@@ -248,13 +284,17 @@
     isQrFlowActive,
     isQrFlowPhase,
     confirmQrLoginSuccess,
-    deriveAuthUiPhase,
     shouldApplySessionSnapshot,
+    canRestoreTrustedAuth,
     validateAccountSwitchResult,
     validateLogoutResult,
     shouldReplaceConvList,
     resolveConvRefreshResult,
     shouldApplyConversationData,
+    shouldApplyAiResult,
+    shouldApplySendResult,
+    shouldApplyPollEvents,
+    aiDraftKey,
     syncOrdersLayout,
     createWorkspaceSnapshot,
     loginBodyDelegatedAction,

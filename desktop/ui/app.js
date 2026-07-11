@@ -82,6 +82,16 @@
     qrTargetAccountId: "",
     enrichInFlight: new Set(),
     enrichFailedAt: {},
+    aiRequestId: 0,
+    aiDraftsByKey: {},
+    aiIntentByKey: {},
+    aiStateByKey: {},
+    eventSinceByAccount: {},
+    listenGeneration: 0,
+    composerValue: "",
+    buyerTitle: "",
+    buyerAvatar: "",
+    buyerMeta: "",
   };
   let _progressCount = 0;
   let _progressTimer = null;
@@ -120,30 +130,97 @@
     return state.authGeneration;
   }
 
-  function bumpAccountGeneration() {
+  function bumpAccountGeneration({ resetWorkspace = false } = {}) {
     state.accountGeneration += 1;
+    state.aiRequestId += 1;
     _selectReqSeq += 1;
     _contextLoadGen += 1;
     _ordersLoadGen += 1;
+    state.listenGeneration += 1;
     if (_convAbortController) {
       _convAbortController.abort();
       _convAbortController = null;
     }
     state.enrichInFlight.clear();
+    if (resetWorkspace) {
+      state.currentUid = "";
+      state.messages = [];
+      state.orders = null;
+      state.contextLoading = false;
+      state.ordersLoading = false;
+      state.contextError = "";
+      state.ordersError = "";
+      state.aiDraft = "";
+      state.aiIntent = "";
+      state.aiState = "idle";
+      $("composerInput").value = "";
+    }
     return state.accountGeneration;
+  }
+
+  function aiScopeKey(uid) {
+    return UI().aiDraftKey ? UI().aiDraftKey(state.activeAccountId, uid) : `${state.activeAccountId}:${uid}`;
+  }
+
+  function saveAiDraftForCurrent() {
+    const uid = state.currentUid;
+    if (!uid) return;
+    const key = aiScopeKey(uid);
+    state.aiDraftsByKey[key] = state.aiDraft || "";
+    state.aiIntentByKey[key] = state.aiIntent || "";
+    state.aiStateByKey[key] = state.aiState || "idle";
+  }
+
+  function loadAiDraftForUid(uid) {
+    if (!uid) {
+      state.aiDraft = "";
+      state.aiIntent = "";
+      state.aiState = "idle";
+      return;
+    }
+    const key = aiScopeKey(uid);
+    state.aiDraft = state.aiDraftsByKey[key] || "";
+    state.aiIntent = state.aiIntentByKey[key] || "";
+    state.aiState = state.aiStateByKey[key] || "idle";
+  }
+
+  function getEventSince(accountId) {
+    const aid = String(accountId || state.activeAccountId || "");
+    return Number(state.eventSinceByAccount[aid] || 0);
+  }
+
+  function setEventSince(accountId, seq) {
+    const aid = String(accountId || state.activeAccountId || "");
+    if (!aid) return;
+    state.eventSinceByAccount[aid] = Number(seq || 0);
+    if (aid === state.activeAccountId) state.eventSince = Number(seq || 0);
+  }
+
+  function commitTrustedAuthSnapshot(overrides = {}) {
+    state.authLastTrusted = {
+      loggedIn: overrides.loggedIn != null ? Boolean(overrides.loggedIn) : Boolean(state.loggedIn),
+      activeAccountId: String(overrides.activeAccountId ?? state.activeAccountId ?? ""),
+      accounts: (overrides.accounts || state.accounts || []).slice(),
+      shopName: overrides.shopName || state.lastSession?.shop_name || "",
+      at: Date.now(),
+      generation: state.authGeneration,
+      accountGeneration: state.accountGeneration,
+    };
+    state.authSyncError = "";
+  }
+
+  function clearTrustedAuth() {
+    state.authLastTrusted = null;
   }
 
   function rememberTrustedAuth(j) {
     if (!j || j.timeout || (j.ok === false && j.logged_in === undefined && !j.accounts)) return;
-    state.authLastTrusted = {
+    commitTrustedAuthSnapshot({
       loggedIn: effectiveLoggedIn(j),
       activeAccountId: String(j.active_account_id || state.activeAccountId || ""),
-      accounts: (j.accounts || []).slice(),
+      accounts: j.accounts || [],
       shopName: j.shop_name || "",
-      at: Date.now(),
-      generation: state.authGeneration,
-    };
-    state.authSyncError = "";
+    });
     if (state.authStatus === UI().AUTH_STATUS?.DEGRADED) {
       state.authStatus = state.authLastTrusted.loggedIn
         ? UI().AUTH_STATUS?.LOGGED_IN || "logged_in"
@@ -151,9 +228,16 @@
     }
   }
 
-  function restoreTrustedAuth() {
+  function restoreTrustedAuth(ctx = {}) {
     const t = state.authLastTrusted;
-    if (!t) return false;
+    const check = UI().canRestoreTrustedAuth
+      ? UI().canRestoreTrustedAuth(t, {
+          authGeneration: ctx.snapshotGeneration ?? state.authGeneration,
+          requiredAccountId: ctx.requiredAccountId ?? state.activeAccountId,
+          requiredLoggedIn: ctx.requiredLoggedIn,
+        })
+      : { ok: Boolean(t) };
+    if (!check.ok) return false;
     state.loggedIn = Boolean(t.loggedIn);
     state.activeAccountId = t.activeAccountId || state.activeAccountId;
     state.accounts = (t.accounts || []).slice();
@@ -224,6 +308,9 @@
   const CS_MODE = true;
 
   function resetWorkspaceState() {
+    if (state.activeAccountId) {
+      state.eventSinceByAccount[state.activeAccountId] = 0;
+    }
     state.eventSince = 0;
     state.conversations = [];
     state.convMeta = {};
@@ -583,10 +670,22 @@
   }
 
   function syncLoginState(j, { trust = true } = {}) {
+    const prevAccountId = state.activeAccountId;
     if (trust) {
       state.lastSession = j;
       state.accounts = j.accounts || [];
-      state.activeAccountId = j.active_account_id || "";
+      const backendActive = String(j.active_account_id || "").trim();
+      if (backendActive) state.activeAccountId = backendActive;
+    }
+    if (
+      trust &&
+      j.active_account_id &&
+      String(j.active_account_id) !== String(prevAccountId) &&
+      !state.authPendingAction &&
+      !state.qrPollingActive
+    ) {
+      bumpAccountGeneration();
+      state.eventSince = getEventSince(state.activeAccountId);
     }
     const activeRow = state.accounts.find((a) => a.id === state.activeAccountId);
     if (state.qrPollingActive) {
@@ -628,14 +727,26 @@
       const j = await api("/api/session?light=1", BG_API);
       if (reqGen !== _authRefreshGen) return;
       const gate = UI().shouldApplySessionSnapshot
-        ? UI().shouldApplySessionSnapshot(j, { authGeneration: snapshotGen, snapshotGeneration: snapshotGen })
+        ? UI().shouldApplySessionSnapshot(j, {
+            authGeneration: state.authGeneration,
+            snapshotGeneration: snapshotGen,
+          })
         : { apply: !(j.timeout || (j.ok === false && !j.accounts && j.logged_in === undefined)), degraded: Boolean(j.timeout) };
       if (!gate.apply) {
         if (gate.degraded) {
           setAuthSyncDegraded(j.timeout ? "状态同步超时，保留上次登录状态" : "状态同步失败，保留上次登录状态");
-          restoreTrustedAuth();
+          restoreTrustedAuth({
+            snapshotGeneration: snapshotGen,
+            requiredAccountId: state.activeAccountId,
+          });
           if (state.authLastTrusted) {
-            renderLogin(state.lastSession || { logged_in: state.authLastTrusted.loggedIn, accounts: state.authLastTrusted.accounts });
+            renderLogin(
+              state.lastSession || {
+                logged_in: state.authLastTrusted.loggedIn,
+                accounts: state.authLastTrusted.accounts,
+                active_account_id: state.activeAccountId,
+              }
+            );
           }
         }
         return;
@@ -670,9 +781,20 @@
       }
     } catch {
       if (reqGen !== _authRefreshGen) return;
-      if (restoreTrustedAuth()) {
+      if (
+        restoreTrustedAuth({
+          snapshotGeneration: snapshotGen,
+          requiredAccountId: state.activeAccountId,
+        })
+      ) {
         setAuthSyncDegraded("无法连接后端，保留上次登录状态");
-        renderLogin(state.lastSession || { logged_in: state.authLastTrusted?.loggedIn, accounts: state.authLastTrusted?.accounts || [] });
+        renderLogin(
+          state.lastSession || {
+            logged_in: state.authLastTrusted?.loggedIn,
+            accounts: state.authLastTrusted?.accounts || [],
+            active_account_id: state.activeAccountId,
+          }
+        );
       } else {
         state.authStatus = UI().AUTH_STATUS?.ERROR || "error";
         renderLogin({ logged_in: false, qr: { phase: "error", error: "无法连接后端" } });
@@ -762,13 +884,15 @@
     const lockToken = tryAcquireLock("switch");
     if (lockToken == null) return;
 
-    const snapshot = UI().createWorkspaceSnapshot ? UI().createWorkspaceSnapshot(state) : null;
+    const snapshot = captureWorkspaceSnapshot();
     const prevAccountId = state.activeAccountId;
     const sel = $("accountSelect");
     if (sel) sel.value = prevAccountId;
 
     state.authPendingAction = "switching";
     bumpAuthGeneration();
+    bumpAccountGeneration();
+    clearTrustedAuth();
     if (!preserveQr) toast("正在切换账号…");
     if (!preserveQr) {
       resetWorkspaceState();
@@ -789,6 +913,7 @@
       if (!valid.ok) {
         if (snapshot) restoreWorkspaceSnapshot(snapshot);
         state.activeAccountId = prevAccountId;
+        state.accountGeneration = snapshot?.accountGeneration ?? state.accountGeneration;
         if (sel) sel.value = prevAccountId;
         renderAccountPicker();
         toast("切换失败: " + (valid.error || "请重试"));
@@ -796,13 +921,18 @@
         return;
       }
       if (!preserveQr) {
-        state.eventSince = 0;
         state.activeAccountId = valid.activeAccountId || accountId;
+        state.eventSince = getEventSince(state.activeAccountId);
+        commitTrustedAuthSnapshot({
+          activeAccountId: state.activeAccountId,
+          loggedIn: true,
+        });
         await refreshLogin(false);
         await refreshConversations(true, state.activeCategory || "recent", { heavy: false });
         toast("已切换账号");
       } else {
         state.activeAccountId = valid.activeAccountId || accountId;
+        commitTrustedAuthSnapshot({ activeAccountId: state.activeAccountId });
         renderAccountPicker();
       }
     } catch (e) {
@@ -822,6 +952,7 @@
 
   function restoreWorkspaceSnapshot(snapshot) {
     if (!snapshot) return;
+    state.eventSinceByAccount = { ...(snapshot.eventSinceByAccount || {}) };
     state.eventSince = snapshot.eventSince;
     state.conversations = (snapshot.conversations || []).slice();
     state.convMeta = JSON.parse(JSON.stringify(snapshot.convMeta || {}));
@@ -833,17 +964,54 @@
     state.contextLoading = snapshot.contextLoading;
     state.contextError = snapshot.contextError || "";
     state.listenOn = snapshot.listenOn;
+    state.listenGeneration = snapshot.listenGeneration || state.listenGeneration;
     state.loggedIn = snapshot.loggedIn;
     state.loginPhase = snapshot.loginPhase;
     state.activeAccountId = snapshot.activeAccountId || "";
+    state.accountGeneration = snapshot.accountGeneration ?? state.accountGeneration;
     state.accounts = (snapshot.accounts || []).slice();
+    state.authStatus = snapshot.authStatus || state.authStatus;
+    state.authSyncError = snapshot.authSyncError || "";
+    state.authPendingAction = null;
+    state.aiDraft = snapshot.aiDraft || "";
+    state.aiIntent = snapshot.aiIntent || "";
+    state.aiState = snapshot.aiState || "idle";
+    state.humanTakeover = Boolean(snapshot.humanTakeover);
     state.convLastSuccess = snapshot.convLastSuccess
       ? { ...snapshot.convLastSuccess, items: (snapshot.convLastSuccess.items || []).slice() }
       : null;
+    const sel = $("accountSelect");
+    if (sel) sel.value = snapshot.accountSelectValue || state.activeAccountId || "";
+    $("buyerTitle").textContent = snapshot.buyerTitle || "选择左侧会话";
+    $("buyerAvatar").textContent = snapshot.buyerAvatar || "客";
+    $("buyerMeta").textContent = snapshot.buyerMeta || "暂无选中买家";
+    $("composerInput").value = snapshot.composerValue || "";
+    renderAccountPicker();
     renderConvList();
+    updateBuyerMeta(state.currentUid);
     renderMessages();
     renderOrders();
+    renderBuyerOverview();
+    renderInsight();
+    setAiState(state.aiState, $("aiHint")?.textContent || "", { skipPersist: true });
+    renderLogin(
+      state.lastSession || {
+        logged_in: state.loggedIn,
+        accounts: state.accounts,
+        active_account_id: state.activeAccountId,
+        shop_name: state.lastSession?.shop_name,
+      }
+    );
     updateAuthChrome();
+  }
+
+  function captureWorkspaceSnapshot() {
+    const snap = UI().createWorkspaceSnapshot ? UI().createWorkspaceSnapshot(state) : {};
+    snap.buyerTitle = $("buyerTitle")?.textContent || "";
+    snap.buyerAvatar = $("buyerAvatar")?.textContent || "";
+    snap.buyerMeta = $("buyerMeta")?.textContent || "";
+    snap.composerValue = $("composerInput")?.value || "";
+    return snap;
   }
 
   async function addAccount() {
@@ -859,9 +1027,9 @@
     return "/api/qr-login/image?t=" + Date.now();
   }
 
-  function qrLoginSucceeded(j) {
+  function qrLoginSucceeded(j, qrGen) {
     const ctx = {
-      qrGeneration: state.qrGeneration,
+      qrGeneration: qrGen,
       currentQrGeneration: state.qrGeneration,
       qrTargetAccountId: state.qrTargetAccountId,
       qrTaskId: state.qrTaskId,
@@ -878,10 +1046,12 @@
     const lockToken = tryAcquireLock("logout");
     if (lockToken == null) return;
 
-    const snapshot = UI().createWorkspaceSnapshot ? UI().createWorkspaceSnapshot(state) : null;
+    const snapshot = captureWorkspaceSnapshot();
     const logoutAid = state.activeAccountId || "";
     state.authPendingAction = "logging_out";
     bumpAuthGeneration();
+    bumpAccountGeneration();
+    clearTrustedAuth();
     updateAuthChrome();
     _lastLoginRenderKey = "";
     renderLogin({
@@ -912,6 +1082,11 @@
       state.activeAccountId = valid.activeAccountId || j.active_account_id || j.switched_to || "";
       state.loggedIn = Boolean(valid.loggedIn);
       state.loginPhase = state.loggedIn ? "logged_in" : "logged_out";
+      state.eventSince = getEventSince(state.activeAccountId);
+      commitTrustedAuthSnapshot({
+        activeAccountId: state.activeAccountId,
+        loggedIn: state.loggedIn,
+      });
       _lastLoginRenderKey = "";
       await refreshLogin(false);
       if (!state.loggedIn) {
@@ -932,9 +1107,9 @@
     }
   }
 
-  async function completeQrLoginSuccess(j) {
+  async function completeQrLoginSuccess(j, qrGen) {
     const ctx = {
-      qrGeneration: state.qrGeneration,
+      qrGeneration: qrGen,
       currentQrGeneration: state.qrGeneration,
       qrTargetAccountId: state.qrTargetAccountId,
       qrTaskId: state.qrTaskId,
@@ -944,7 +1119,12 @@
     if (!confirmed.ok) return;
 
     stopQrPoll();
-    bumpAuthGeneration();
+    const prevAccount = state.activeAccountId;
+    if (confirmed.activeId && confirmed.activeId !== prevAccount) {
+      bumpAccountGeneration();
+    }
+    state.activeAccountId = confirmed.activeId || state.activeAccountId;
+    state.eventSince = getEventSince(state.activeAccountId);
     const sendOk = confirmed.sendReady === true;
     toast(
       sendOk ? "登录成功，已进入客服工作台" : "登录成功，消息通道预热中，不影响查看会话"
@@ -953,6 +1133,11 @@
     state.loggedIn = true;
     state.loginPhase = "logged_in";
     state.authStatus = UI().AUTH_STATUS?.LOGGED_IN || "logged_in";
+    commitTrustedAuthSnapshot({
+      activeAccountId: state.activeAccountId,
+      loggedIn: true,
+      shopName: j.shop_name,
+    });
     await refreshLogin(false);
     await refreshConversations(true, "recent", { heavy: false });
     if (state.loggedIn && j.listen_ready !== false) {
@@ -1231,6 +1416,7 @@
     stopQrPoll();
     bumpAuthGeneration();
     state.qrGeneration += 1;
+    clearTrustedAuth();
     _lastLoginRenderKey = "";
     state.loggedIn = false;
     state.qrImgSrc = "";
@@ -1351,14 +1537,14 @@
       }
       state.loggedIn = effectiveLoggedIn(j);
       syncLoginState(j, { trust: false });
-      if (state.qrPollingActive && qrLoginSucceeded(j)) {
-        await completeQrLoginSuccess(j);
+      if (state.qrPollingActive && qrLoginSucceeded(j, qrGen)) {
+        await completeQrLoginSuccess(j, qrGen);
         return;
       }
       renderLogin(j);
       if (j.qr?.phase === "bootstrapping") {
-        if (qrLoginSucceeded(j)) {
-          await completeQrLoginSuccess(j);
+        if (qrLoginSucceeded(j, qrGen)) {
+          await completeQrLoginSuccess(j, qrGen);
           return;
         }
         if (
@@ -1383,9 +1569,9 @@
         setTimeout(tick, 1200);
         return;
       }
-      if (j.logged_in && qrLoginSucceeded(j) && !isQrFlowActive(j)) {
+      if (j.logged_in && qrLoginSucceeded(j, qrGen) && !isQrFlowActive(j)) {
         stopQrPoll();
-        await completeQrLoginSuccess(j);
+        await completeQrLoginSuccess(j, qrGen);
         return;
       }
       if (!isQrFlowActive(j)) {
@@ -1680,6 +1866,7 @@
   async function loadConversationContext(uid, selectSeq) {
     const loadGen = ++_contextLoadGen;
     const accountGen = state.accountGeneration;
+    const accountId = state.activeAccountId;
     state.contextLoading = true;
     state.contextError = "";
     renderMessages();
@@ -1701,6 +1888,8 @@
       currentLoadGen: _contextLoadGen,
       accountGeneration: accountGen,
       currentAccountGeneration: state.accountGeneration,
+      accountId,
+      currentAccountId: state.activeAccountId,
     })) {
       return;
     }
@@ -1769,6 +1958,8 @@
       currentLoadGen: _ordersLoadGen,
       accountGeneration: accountGen,
       currentAccountGeneration: state.accountGeneration,
+      accountId,
+      currentAccountId: state.activeAccountId,
     })) {
       return;
     }
@@ -1816,8 +2007,10 @@
 
   async function selectConversation(uid) {
     if (!uid) return;
+    saveAiDraftForCurrent();
     const reqId = ++_selectReqSeq;
     state.currentUid = uid;
+    loadAiDraftForUid(uid);
     const conv = state.conversations.find((c) => c.security_user_id === uid);
     const name = conv ? convName(conv) : "买家";
     $("buyerTitle").textContent = name;
@@ -1837,6 +2030,8 @@
     updateBuyerMeta(uid);
     renderMessages();
     renderOrders();
+    $("aiDraft").hidden = (state.aiState !== "ready" && state.aiState !== "sent") || !state.aiDraft;
+    if (state.aiDraft) $("aiDraftText").textContent = state.aiDraft;
 
     void loadConversationContext(uid, reqId);
     void loadConversationOrders(uid, reqId);
@@ -2023,80 +2218,179 @@
   }
 
   /* ——— AI ——— */
-  function setAiState(s, hint) {
+  function setAiState(s, hint, opts = {}) {
+    const targetUid = opts.uid || state.currentUid;
+    if (!opts.skipPersist && opts.requestId != null && opts.requestId !== state.aiRequestId) return;
+    if (!opts.skipPersist && opts.uid && opts.uid !== state.currentUid) return;
     state.aiState = s;
     $("aiStateText").textContent = aiStatusLabel();
-    $("aiHint").textContent = hint || $("aiHint").textContent;
+    if (hint != null) $("aiHint").textContent = hint;
     const pulsing = ["analyzing", "generating", "sending"].includes(s);
     $("aiPulse").hidden = !pulsing;
     $("aiPulseBar").hidden = !pulsing;
-    $("aiDraft").hidden = s !== "ready" && s !== "sent" || !state.aiDraft;
+    $("aiDraft").hidden = (s !== "ready" && s !== "sent") || !state.aiDraft;
     if (state.aiDraft) $("aiDraftText").textContent = state.aiDraft;
-    const uid = state.currentUid;
+    const uid = targetUid;
     if (uid && state.convMeta[uid]) {
       if (s === "generating") state.convMeta[uid].aiStatus = "gen";
       else if (s === "ready" || s === "sent") state.convMeta[uid].aiStatus = "done";
       else if (s === "idle") state.convMeta[uid].aiStatus = "wait";
-      renderConvList();
+      if (uid === state.currentUid) renderConvList();
     }
-    renderBuyerOverview();
-    renderInsight();
+    if (uid) {
+      const key = aiScopeKey(uid);
+      state.aiStateByKey[key] = s;
+    }
+    if (uid === state.currentUid) {
+      renderBuyerOverview();
+      renderInsight();
+    }
   }
 
   async function generateAiReply(triggerText) {
     if (!state.currentUid || state.aiMode === "pause" || state.humanTakeover) return;
-    setAiState("analyzing", "AI 正在看聊天记录和订单信息…");
+    const requestUid = state.currentUid;
+    const requestAccountId = state.activeAccountId;
+    const requestAccountGeneration = state.accountGeneration;
+    const requestSelectSeq = _selectReqSeq;
+    const requestId = ++state.aiRequestId;
     const recent = state.messages.slice(-12).map((m) => ({
       role: isBuyerRole(m.role) ? "customer" : "service",
       text: m.text || "",
     }));
     const lastQ = triggerText || [...recent].reverse().find((m) => m.role === "customer")?.text || "";
+    setAiState("analyzing", "AI 正在看聊天记录和订单信息…", { uid: requestUid, requestId });
     try {
-      setAiState("generating", "AI 正在整理更合适的回复…");
+      setAiState("generating", "AI 正在整理更合适的回复…", { uid: requestUid, requestId });
       const j = await api("/api/ai/suggest", {
         method: "POST",
         body: JSON.stringify({
-          user_id: state.currentUid,
+          user_id: requestUid,
           message: lastQ,
           current_customer_question: lastQ,
           recent_messages: recent,
-          buyer_name: state.convMeta[state.currentUid]?.buyerName,
+          buyer_name: state.convMeta[requestUid]?.buyerName,
           mode: "fast",
         }),
       });
+      const canApply = UI().shouldApplyAiResult
+        ? UI().shouldApplyAiResult({
+            requestId,
+            currentRequestId: state.aiRequestId,
+            accountGeneration: requestAccountGeneration,
+            currentAccountGeneration: state.accountGeneration,
+            accountId: requestAccountId,
+            currentAccountId: state.activeAccountId,
+            uid: requestUid,
+            currentUid: state.currentUid,
+            selectSeq: requestSelectSeq,
+            currentSelectSeq: _selectReqSeq,
+            humanTakeover: state.humanTakeover,
+            aiMode: state.aiMode,
+          })
+        : requestUid === state.currentUid;
+      if (!canApply) return;
       if (!j.ok || !j.reply) {
-        setAiState("fail", j.message || "AI 暂时没整理好回复，可以稍后再试");
+        setAiState("fail", j.message || "AI 暂时没整理好回复，可以稍后再试", { uid: requestUid, requestId });
         return;
       }
-      state.aiDraft = j.reply;
-      state.aiIntent = j.intent || "other";
-      $("composerInput").value = j.reply;
-      setAiState("ready", "回复已整理好，确认后可以发送");
-      if (state.aiMode === "auto" && !state.humanTakeover) {
-        await sendMessage(j.reply, true);
+      const key = aiScopeKey(requestUid);
+      state.aiDraftsByKey[key] = j.reply;
+      state.aiIntentByKey[key] = j.intent || "other";
+      if (requestUid === state.currentUid) {
+        state.aiDraft = j.reply;
+        state.aiIntent = j.intent || "other";
+        $("composerInput").value = j.reply;
+        setAiState("ready", "回复已整理好，确认后可以发送", { uid: requestUid, requestId });
       }
-    } catch (e) {
-      setAiState("fail", "AI 服务连接失败，请确认本地 RAG 已启动");
+      if (state.aiMode === "auto" && !state.humanTakeover) {
+        await sendMessage({
+          uid: requestUid,
+          text: j.reply,
+          fromAi: true,
+          accountId: requestAccountId,
+          accountGeneration: requestAccountGeneration,
+          selectSeq: requestSelectSeq,
+          aiRequestId: requestId,
+        });
+      }
+    } catch {
+      if (
+        UI().shouldApplyAiResult &&
+        !UI().shouldApplyAiResult({
+          requestId,
+          currentRequestId: state.aiRequestId,
+          accountGeneration: requestAccountGeneration,
+          currentAccountGeneration: state.accountGeneration,
+          accountId: requestAccountId,
+          currentAccountId: state.activeAccountId,
+          uid: requestUid,
+          currentUid: state.currentUid,
+          selectSeq: requestSelectSeq,
+          currentSelectSeq: _selectReqSeq,
+          humanTakeover: state.humanTakeover,
+          aiMode: state.aiMode,
+        })
+      ) {
+        return;
+      }
+      setAiState("fail", "AI 服务连接失败，请确认本地 RAG 已启动", { uid: requestUid, requestId });
     }
   }
 
-  async function sendMessage(text, fromAi = false) {
-    const t = (text || $("composerInput").value).trim();
-    if (!t || !state.currentUid) return;
+  async function sendMessage(textOrOpts, fromAiFlag = false) {
+    const opts =
+      textOrOpts && typeof textOrOpts === "object"
+        ? textOrOpts
+        : { text: textOrOpts, fromAi: fromAiFlag };
+    const uid = String(opts.uid || state.currentUid || "");
+    const t = String(opts.text ?? $("composerInput").value ?? "").trim();
+    if (!t || !uid) return;
+    const requestAccountId = String(opts.accountId ?? state.activeAccountId ?? "");
+    const requestAccountGeneration = opts.accountGeneration ?? state.accountGeneration;
+    const requestSelectSeq = opts.selectSeq ?? _selectReqSeq;
+    const requestAiId = opts.aiRequestId ?? state.aiRequestId;
+    const fromAi = Boolean(opts.fromAi);
+    if (
+      requestAccountId !== state.activeAccountId ||
+      uid !== state.currentUid ||
+      requestAccountGeneration !== state.accountGeneration
+    ) {
+      return;
+    }
     const btn = $("btnSend");
     btn.classList.add("loading");
     btn.disabled = true;
-    if (fromAi) setAiState("sending", "正在发送回复…");
+    if (fromAi) setAiState("sending", "正在发送回复…", { uid, requestId: requestAiId });
     try {
       const j = await api("/api/send", {
         method: "POST",
-        body: JSON.stringify({ user_id: state.currentUid, text: t }),
+        body: JSON.stringify({ user_id: uid, text: t }),
       });
+      const canApply = UI().shouldApplySendResult
+        ? UI().shouldApplySendResult({
+            requestId: requestAiId,
+            currentRequestId: state.aiRequestId,
+            accountGeneration: requestAccountGeneration,
+            currentAccountGeneration: state.accountGeneration,
+            accountId: requestAccountId,
+            currentAccountId: state.activeAccountId,
+            uid,
+            currentUid: state.currentUid,
+            selectSeq: requestSelectSeq,
+            currentSelectSeq: _selectReqSeq,
+            humanTakeover: state.humanTakeover,
+            aiMode: state.aiMode,
+          })
+        : uid === state.currentUid;
+      if (!canApply) return;
       if (j.ok) {
         toast(fromAi ? "AI 回复已发送" : "发送成功");
-        $("composerInput").value = "";
-        setAiState(fromAi ? "sent" : "idle", fromAi ? "本条 AI 回复已发出" : "");
-        await selectConversation(state.currentUid);
+        if (uid === state.currentUid) {
+          $("composerInput").value = "";
+          setAiState(fromAi ? "sent" : "idle", fromAi ? "本条 AI 回复已发出" : "", { uid, requestId: requestAiId });
+          await selectConversation(uid);
+        }
       } else if (j.needs_cdp_onboard || j.recommended_action === "cdp_onboard") {
         toast((j.reason || j.blockers?.[0] || "发信未就绪") + " — 请使用浏览器登录", 6000);
         setAiState("fail", "需浏览器登录预热发信");
@@ -2126,9 +2420,25 @@
 
   async function pollEvents() {
     if (!state.listenOn) return;
+    const requestAccountId = state.activeAccountId;
+    const requestAccountGeneration = state.accountGeneration;
+    const requestListenGeneration = state.listenGeneration;
+    const requestSince = getEventSince(requestAccountId);
     try {
-      const q = `/api/events?since=${state.eventSince}&account_id=${encodeURIComponent(state.activeAccountId || "")}`;
+      const q = `/api/events?since=${requestSince}&account_id=${encodeURIComponent(requestAccountId || "")}`;
       const j = await api(q, BG_API);
+      if (
+        !UI().shouldApplyPollEvents({
+          accountId: requestAccountId,
+          currentAccountId: state.activeAccountId,
+          accountGeneration: requestAccountGeneration,
+          currentAccountGeneration: state.accountGeneration,
+          listenGeneration: requestListenGeneration,
+          currentListenGeneration: state.listenGeneration,
+        })
+      ) {
+        return;
+      }
       if (j.ok === false) {
         _eventFailCount += 1;
         if (_eventFailCount >= 3) {
@@ -2143,11 +2453,23 @@
       }
       _eventFailCount = 0;
       (j.items || []).forEach((e) => {
-        const eventAccount = e.account_id || "";
+        if (
+          !UI().shouldApplyPollEvents({
+            accountId: requestAccountId,
+            currentAccountId: state.activeAccountId,
+            accountGeneration: requestAccountGeneration,
+            currentAccountGeneration: state.accountGeneration,
+            listenGeneration: requestListenGeneration,
+            currentListenGeneration: state.listenGeneration,
+          })
+        ) {
+          return;
+        }
+        const eventAccount = String(e.account_id || requestAccountId || "");
         if (eventAccount && state.activeAccountId && eventAccount !== state.activeAccountId) {
           return;
         }
-        state.eventSince = e.seq;
+        if (e.seq != null) setEventSince(eventAccount || requestAccountId, e.seq);
         if (e.kind === "message" && e.message) {
           const m = e.message;
           const uid = m.security_user_id || state.currentUid;
@@ -2411,7 +2733,30 @@
     }
   }
 
-  if (document.readyState === "loading") {
+  if (typeof globalThis !== "undefined" && globalThis.__PIGEON_TEST_MODE__) {
+    globalThis.__PIGEON_TEST__ = {
+      state,
+      bumpAccountGeneration,
+      bumpAuthGeneration,
+      restoreTrustedAuth,
+      commitTrustedAuthSnapshot,
+      clearTrustedAuth,
+      captureWorkspaceSnapshot,
+      restoreWorkspaceSnapshot,
+      switchAccount,
+      logoutCurrentAccount,
+      startQrLogin,
+      refreshLogin,
+      generateAiReply,
+      sendMessage,
+      selectConversation,
+      pollEvents,
+      syncLoginState,
+      shouldApplyAiResult: UI().shouldApplyAiResult,
+      canRestoreTrustedAuth: UI().canRestoreTrustedAuth,
+      actionLocks,
+    };
+  } else if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
   } else {
     init();
