@@ -89,6 +89,7 @@
     eventSinceByAccount: {},
     listenGeneration: 0,
     composerValue: "",
+    composerDraftsByKey: {},
     buyerTitle: "",
     buyerAvatar: "",
     buyerMeta: "",
@@ -98,6 +99,8 @@
   let _selectReqSeq = 0;
   let _contextLoadGen = 0;
   let _ordersLoadGen = 0;
+  let _sendRequestId = 0;
+  let _sendInFlight = false;
   let _ordersWideLayout = window.innerWidth > 1100;
   let _convAbortController = null;
   let _authRefreshGen = 0;
@@ -160,6 +163,41 @@
 
   function aiScopeKey(uid) {
     return UI().aiDraftKey ? UI().aiDraftKey(state.activeAccountId, uid) : `${state.activeAccountId}:${uid}`;
+  }
+
+  function composerDraftKey(accountId, uid) {
+    return UI().aiDraftKey ? UI().aiDraftKey(accountId, uid) : `${accountId}:${uid}`;
+  }
+
+  function saveComposerDraftForCurrent() {
+    const uid = state.currentUid;
+    const accountId = state.activeAccountId;
+    if (!uid || !accountId) return;
+    const input = $("composerInput");
+    const text = input ? input.value : "";
+    const key = composerDraftKey(accountId, uid);
+    const existing = state.composerDraftsByKey[key];
+    if (existing?.sent && !text) return;
+    state.composerDraftsByKey[key] = {
+      text,
+      fromAi: Boolean(state.aiDraft && text === state.aiDraft),
+      updatedAt: Date.now(),
+    };
+  }
+
+  function loadComposerDraftForUid(uid) {
+    const input = $("composerInput");
+    if (!input) return;
+    if (!uid || !state.activeAccountId) {
+      input.value = "";
+      state.composerValue = "";
+      return;
+    }
+    const key = composerDraftKey(state.activeAccountId, uid);
+    const draft = state.composerDraftsByKey[key];
+    const text = draft && !draft.sent ? draft.text || "" : "";
+    input.value = text;
+    state.composerValue = text;
   }
 
   function saveAiDraftForCurrent() {
@@ -232,7 +270,7 @@
     const t = state.authLastTrusted;
     const check = UI().canRestoreTrustedAuth
       ? UI().canRestoreTrustedAuth(t, {
-          authGeneration: ctx.snapshotGeneration ?? state.authGeneration,
+          currentAuthGeneration: ctx.currentAuthGeneration ?? ctx.authGeneration ?? state.authGeneration,
           requiredAccountId: ctx.requiredAccountId ?? state.activeAccountId,
           requiredLoggedIn: ctx.requiredLoggedIn,
         })
@@ -736,7 +774,7 @@
         if (gate.degraded) {
           setAuthSyncDegraded(j.timeout ? "状态同步超时，保留上次登录状态" : "状态同步失败，保留上次登录状态");
           restoreTrustedAuth({
-            snapshotGeneration: snapshotGen,
+            currentAuthGeneration: state.authGeneration,
             requiredAccountId: state.activeAccountId,
           });
           if (state.authLastTrusted) {
@@ -783,7 +821,7 @@
       if (reqGen !== _authRefreshGen) return;
       if (
         restoreTrustedAuth({
-          snapshotGeneration: snapshotGen,
+          currentAuthGeneration: state.authGeneration,
           requiredAccountId: state.activeAccountId,
         })
       ) {
@@ -890,6 +928,8 @@
     if (sel) sel.value = prevAccountId;
 
     state.authPendingAction = "switching";
+    saveAiDraftForCurrent();
+    saveComposerDraftForCurrent();
     bumpAuthGeneration();
     bumpAccountGeneration();
     clearTrustedAuth();
@@ -1048,6 +1088,8 @@
 
     const snapshot = captureWorkspaceSnapshot();
     const logoutAid = state.activeAccountId || "";
+    saveAiDraftForCurrent();
+    saveComposerDraftForCurrent();
     state.authPendingAction = "logging_out";
     bumpAuthGeneration();
     bumpAccountGeneration();
@@ -1435,9 +1477,19 @@
       const j = await api("/api/qr-login/start", { method: "POST", body: "{}", trackProgress: true });
       if (lockToken !== actionLocks.qr.token) return;
       if (j.switched_from) {
-        state.activeAccountId = j.account_id || state.activeAccountId;
-        state.qrTargetAccountId = state.activeAccountId;
-        toast(`已切换到空账号槽 ${j.account_id || ""}，请扫码`);
+        const newAid = String(j.account_id || "");
+        if (newAid && newAid !== state.activeAccountId) {
+          saveAiDraftForCurrent();
+          saveComposerDraftForCurrent();
+          bumpAccountGeneration({ resetWorkspace: true });
+          resetWorkspaceState();
+          state.activeAccountId = newAid;
+          state.eventSince = getEventSince(newAid);
+          state.qrTargetAccountId = newAid;
+          toast(`已切换到空账号槽 ${newAid}，请扫码`);
+        } else if (newAid) {
+          state.qrTargetAccountId = newAid;
+        }
       }
       if (j.ok === false || j.qr?.phase === "error") {
         state.qrPollingActive = false;
@@ -1871,26 +1923,38 @@
     state.contextError = "";
     renderMessages();
 
-    const ctxRes = await api("/api/context?user_id=" + encodeURIComponent(uid), {
-      ...BG_API,
-      timeoutMs: 6000,
-    });
-
-    if (selectSeq !== _selectReqSeq || uid !== state.currentUid || loadGen !== _contextLoadGen) {
-      return;
+    let ctxRes;
+    try {
+      ctxRes = await api("/api/context?user_id=" + encodeURIComponent(uid), {
+        ...BG_API,
+        timeoutMs: 6000,
+      });
+    } catch (e) {
+      ctxRes = { ok: false, error: String(e.message || e) };
     }
-    if (!UI().shouldApplyConversationData({
-      selectSeq,
-      currentSelectSeq: _selectReqSeq,
-      uid,
-      currentUid: state.currentUid,
-      loadGen,
-      currentLoadGen: _contextLoadGen,
-      accountGeneration: accountGen,
-      currentAccountGeneration: state.accountGeneration,
-      accountId,
-      currentAccountId: state.activeAccountId,
-    })) {
+
+    const stillCurrent = () =>
+      selectSeq === _selectReqSeq &&
+      uid === state.currentUid &&
+      loadGen === _contextLoadGen &&
+      accountGen === state.accountGeneration &&
+      accountId === state.activeAccountId;
+
+    if (!stillCurrent()) return;
+    if (
+      !UI().shouldApplyConversationData({
+        selectSeq,
+        currentSelectSeq: _selectReqSeq,
+        uid,
+        currentUid: state.currentUid,
+        loadGen,
+        currentLoadGen: _contextLoadGen,
+        accountGeneration: accountGen,
+        currentAccountGeneration: state.accountGeneration,
+        accountId,
+        currentAccountId: state.activeAccountId,
+      })
+    ) {
       return;
     }
 
@@ -1933,6 +1997,7 @@
   async function loadConversationOrders(uid, selectSeq, { heavy = false } = {}) {
     const loadGen = ++_ordersLoadGen;
     const accountGen = state.accountGeneration;
+    const accountId = state.activeAccountId;
     state.ordersLoading = true;
     state.ordersError = "";
     renderOrders();
@@ -1941,26 +2006,38 @@
     if (heavy) qs.set("heavy", "1");
     else qs.set("fast", "1");
 
-    const ordRes = await api("/api/orders?" + qs.toString(), {
-      ...BG_API,
-      timeoutMs: heavy ? 10000 : 4000,
-    });
-
-    if (selectSeq !== _selectReqSeq || uid !== state.currentUid || loadGen !== _ordersLoadGen) {
-      return;
+    let ordRes;
+    try {
+      ordRes = await api("/api/orders?" + qs.toString(), {
+        ...BG_API,
+        timeoutMs: heavy ? 10000 : 4000,
+      });
+    } catch (e) {
+      ordRes = { ok: false, error: String(e.message || e) };
     }
-    if (!UI().shouldApplyConversationData({
-      selectSeq,
-      currentSelectSeq: _selectReqSeq,
-      uid,
-      currentUid: state.currentUid,
-      loadGen,
-      currentLoadGen: _ordersLoadGen,
-      accountGeneration: accountGen,
-      currentAccountGeneration: state.accountGeneration,
-      accountId,
-      currentAccountId: state.activeAccountId,
-    })) {
+
+    const stillCurrent = () =>
+      selectSeq === _selectReqSeq &&
+      uid === state.currentUid &&
+      loadGen === _ordersLoadGen &&
+      accountGen === state.accountGeneration &&
+      accountId === state.activeAccountId;
+
+    if (!stillCurrent()) return;
+    if (
+      !UI().shouldApplyConversationData({
+        selectSeq,
+        currentSelectSeq: _selectReqSeq,
+        uid,
+        currentUid: state.currentUid,
+        loadGen,
+        currentLoadGen: _ordersLoadGen,
+        accountGeneration: accountGen,
+        currentAccountGeneration: state.accountGeneration,
+        accountId,
+        currentAccountId: state.activeAccountId,
+      })
+    ) {
       return;
     }
 
@@ -2008,9 +2085,11 @@
   async function selectConversation(uid) {
     if (!uid) return;
     saveAiDraftForCurrent();
+    saveComposerDraftForCurrent();
     const reqId = ++_selectReqSeq;
     state.currentUid = uid;
     loadAiDraftForUid(uid);
+    loadComposerDraftForUid(uid);
     const conv = state.conversations.find((c) => c.security_user_id === uid);
     const name = conv ? convName(conv) : "买家";
     $("buyerTitle").textContent = name;
@@ -2301,6 +2380,11 @@
         state.aiDraft = j.reply;
         state.aiIntent = j.intent || "other";
         $("composerInput").value = j.reply;
+        state.composerDraftsByKey[composerDraftKey(requestAccountId, requestUid)] = {
+          text: j.reply,
+          fromAi: true,
+          updatedAt: Date.now(),
+        };
         setAiState("ready", "回复已整理好，确认后可以发送", { uid: requestUid, requestId });
       }
       if (state.aiMode === "auto" && !state.humanTakeover) {
@@ -2351,47 +2435,75 @@
     const requestSelectSeq = opts.selectSeq ?? _selectReqSeq;
     const requestAiId = opts.aiRequestId ?? state.aiRequestId;
     const fromAi = Boolean(opts.fromAi);
+    if (!fromAi && _sendInFlight) return;
+    const sendRequestId = ++_sendRequestId;
+    if (!fromAi) _sendInFlight = true;
     if (
-      requestAccountId !== state.activeAccountId ||
-      uid !== state.currentUid ||
-      requestAccountGeneration !== state.accountGeneration
+      !fromAi &&
+      (requestAccountId !== state.activeAccountId ||
+        uid !== state.currentUid ||
+        requestAccountGeneration !== state.accountGeneration)
     ) {
+      if (!fromAi) _sendInFlight = false;
       return;
     }
     const btn = $("btnSend");
     btn.classList.add("loading");
     btn.disabled = true;
     if (fromAi) setAiState("sending", "正在发送回复…", { uid, requestId: requestAiId });
+    const draftKey = composerDraftKey(requestAccountId, uid);
     try {
       const j = await api("/api/send", {
         method: "POST",
         body: JSON.stringify({ user_id: uid, text: t }),
       });
-      const canApply = UI().shouldApplySendResult
-        ? UI().shouldApplySendResult({
-            requestId: requestAiId,
-            currentRequestId: state.aiRequestId,
-            accountGeneration: requestAccountGeneration,
-            currentAccountGeneration: state.accountGeneration,
-            accountId: requestAccountId,
-            currentAccountId: state.activeAccountId,
-            uid,
-            currentUid: state.currentUid,
-            selectSeq: requestSelectSeq,
-            currentSelectSeq: _selectReqSeq,
-            humanTakeover: state.humanTakeover,
-            aiMode: state.aiMode,
-          })
-        : uid === state.currentUid;
-      if (!canApply) return;
+      const resultCtx = {
+        sendRequestId,
+        currentSendRequestId: _sendRequestId,
+        accountGeneration: requestAccountGeneration,
+        currentAccountGeneration: state.accountGeneration,
+        accountId: requestAccountId,
+        currentAccountId: state.activeAccountId,
+        uid,
+        currentUid: state.currentUid,
+        selectSeq: requestSelectSeq,
+        currentSelectSeq: _selectReqSeq,
+        fromAi,
+        aiRequestId: requestAiId,
+        currentAiRequestId: state.aiRequestId,
+        humanTakeover: state.humanTakeover,
+        aiMode: state.aiMode,
+      };
+      const canApply = fromAi
+        ? UI().shouldApplyAiAutoSendResult
+          ? UI().shouldApplyAiAutoSendResult(resultCtx)
+          : false
+        : UI().shouldApplyManualSendResult
+          ? UI().shouldApplyManualSendResult(resultCtx)
+          : uid === state.currentUid && requestAccountId === state.activeAccountId;
       if (j.ok) {
-        toast(fromAi ? "AI 回复已发送" : "发送成功");
-        if (uid === state.currentUid) {
-          $("composerInput").value = "";
-          setAiState(fromAi ? "sent" : "idle", fromAi ? "本条 AI 回复已发出" : "", { uid, requestId: requestAiId });
-          await selectConversation(uid);
+        state.composerDraftsByKey[draftKey] = {
+          text: "",
+          fromAi: false,
+          updatedAt: Date.now(),
+          sent: true,
+        };
+        if (canApply) {
+          toast(fromAi ? "AI 回复已发送" : "发送成功");
+          if (uid === state.currentUid && requestAccountId === state.activeAccountId) {
+            $("composerInput").value = "";
+            state.composerValue = "";
+            setAiState(fromAi ? "sent" : "idle", fromAi ? "本条 AI 回复已发出" : "", {
+              uid,
+              requestId: requestAiId,
+            });
+            await selectConversation(uid);
+          }
         }
-      } else if (j.needs_cdp_onboard || j.recommended_action === "cdp_onboard") {
+        return;
+      }
+      if (!canApply) return;
+      if (j.needs_cdp_onboard || j.recommended_action === "cdp_onboard") {
         toast((j.reason || j.blockers?.[0] || "发信未就绪") + " — 请使用浏览器登录", 6000);
         setAiState("fail", "需浏览器登录预热发信");
       } else if (j.recommended_action === "cdp_warm_inners") {
@@ -2412,6 +2524,7 @@
     } finally {
       btn.classList.remove("loading");
       btn.disabled = false;
+      if (!fromAi) _sendInFlight = false;
     }
   }
 
@@ -2751,8 +2864,15 @@
       sendMessage,
       selectConversation,
       pollEvents,
+      refreshConversations,
       syncLoginState,
+      bindEvents,
+      saveComposerDraftForCurrent,
+      loadComposerDraftForUid,
+      shouldApplyManualSendResult: UI().shouldApplyManualSendResult,
+      shouldApplyAiAutoSendResult: UI().shouldApplyAiAutoSendResult,
       shouldApplyAiResult: UI().shouldApplyAiResult,
+      shouldApplyPollEvents: UI().shouldApplyPollEvents,
       canRestoreTrustedAuth: UI().canRestoreTrustedAuth,
       actionLocks,
     };

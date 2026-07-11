@@ -204,5 +204,73 @@ test("logout snapshot preserves buyer title fields", () => {
   assert.deepEqual(snap.eventSinceByAccount, { shop_a: 1 });
 });
 
+test("manual send allowed when ai paused or human takeover", () => {
+  const base = {
+    sendRequestId: 1,
+    currentSendRequestId: 1,
+    accountGeneration: 1,
+    currentAccountGeneration: 1,
+    accountId: "shop_a",
+    currentAccountId: "shop_a",
+    uid: "u1",
+    currentUid: "u1",
+    selectSeq: 1,
+    currentSelectSeq: 1,
+  };
+  assert.equal(UI.shouldApplyManualSendResult(base), true);
+});
+
+test("ai auto send rejected when ai paused", () => {
+  assert.equal(
+    UI.shouldApplyAiAutoSendResult({
+      sendRequestId: 1,
+      currentSendRequestId: 1,
+      accountGeneration: 1,
+      currentAccountGeneration: 1,
+      accountId: "shop_a",
+      currentAccountId: "shop_a",
+      uid: "u1",
+      currentUid: "u1",
+      selectSeq: 1,
+      currentSelectSeq: 1,
+      aiRequestId: 1,
+      currentAiRequestId: 1,
+      humanTakeover: false,
+      aiMode: "pause",
+    }),
+    false
+  );
+});
+
+test("ai auto send rejected when human takeover", () => {
+  assert.equal(
+    UI.shouldApplyAiAutoSendResult({
+      sendRequestId: 1,
+      currentSendRequestId: 1,
+      accountGeneration: 1,
+      currentAccountGeneration: 1,
+      accountId: "shop_a",
+      currentAccountId: "shop_a",
+      uid: "u1",
+      currentUid: "u1",
+      selectSeq: 1,
+      currentSelectSeq: 1,
+      aiRequestId: 1,
+      currentAiRequestId: 1,
+      humanTakeover: true,
+      aiMode: "auto",
+    }),
+    false
+  );
+});
+
+test("canRestoreTrustedAuth accepts currentAuthGeneration alias", () => {
+  const r = UI.canRestoreTrustedAuth(
+    { generation: 2, activeAccountId: "shop_a", loggedIn: true, accounts: [] },
+    { currentAuthGeneration: 2, requiredAccountId: "shop_a" }
+  );
+  assert.equal(r.ok, true);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

@@ -96,7 +96,8 @@
     const c = ctx || {};
     const t = trusted;
     if (!t) return { ok: false, reason: "empty" };
-    if (c.authGeneration != null && t.generation != null && t.generation !== c.authGeneration) {
+    const currentAuthGen = c.currentAuthGeneration ?? c.authGeneration;
+    if (currentAuthGen != null && t.generation != null && t.generation !== currentAuthGen) {
       return { ok: false, reason: "stale_auth_generation" };
     }
     if (c.requiredAccountId != null && String(t.activeAccountId || "") !== String(c.requiredAccountId || "")) {
@@ -192,8 +193,32 @@
     return true;
   }
 
+  function shouldApplyManualSendResult(ctx) {
+    const c = ctx || {};
+    if (c.sendRequestId != null && c.currentSendRequestId != null && c.sendRequestId !== c.currentSendRequestId) {
+      return false;
+    }
+    if (c.accountGeneration !== c.currentAccountGeneration) return false;
+    if (c.accountId !== c.currentAccountId) return false;
+    if (c.uid !== c.currentUid) return false;
+    if (c.selectSeq !== c.currentSelectSeq) return false;
+    return true;
+  }
+
+  function shouldApplyAiAutoSendResult(ctx) {
+    if (!shouldApplyManualSendResult(ctx)) return false;
+    const c = ctx || {};
+    if (c.aiRequestId != null && c.currentAiRequestId != null && c.aiRequestId !== c.currentAiRequestId) {
+      return false;
+    }
+    if (c.humanTakeover) return false;
+    if (c.aiMode !== "auto") return false;
+    return true;
+  }
+
   function shouldApplySendResult(ctx) {
-    return shouldApplyAiResult(ctx);
+    if (ctx && ctx.fromAi) return shouldApplyAiAutoSendResult(ctx);
+    return shouldApplyManualSendResult(ctx);
   }
 
   function shouldApplyPollEvents(ctx) {
@@ -292,6 +317,8 @@
     resolveConvRefreshResult,
     shouldApplyConversationData,
     shouldApplyAiResult,
+    shouldApplyManualSendResult,
+    shouldApplyAiAutoSendResult,
     shouldApplySendResult,
     shouldApplyPollEvents,
     aiDraftKey,
