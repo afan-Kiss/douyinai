@@ -52,4 +52,9 @@ jobs:
 
       - name: Go tests
         working-directory: desktop/pigeon-feige
-        run: go test ./...
+        env:
+          CGO_ENABLED: 1
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev
+          go test ./...
